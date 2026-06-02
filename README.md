@@ -1,6 +1,6 @@
-# pi-ask-user
+# pi-telegram-notify
 
-A Pi package that adds an interactive `ask_user` tool for collecting user decisions during an agent run.
+A Pi package that sends Telegram notifications for `ask_user` prompts and when a Pi agent becomes idle, while still bundling the interactive `ask_user` tool.
 
 ## Demo
 
@@ -18,6 +18,10 @@ High-quality video: [ask-user-demo.mp4](./media/ask-user-demo.mp4)
 - Context display support
 - Configurable display mode: `overlay` (modal, default) or `inline` (rendered directly in the flow)
 - Runtime overlay toggle: press the configured overlay-toggle key (`alt+o` by default, configurable per call or via env var) while the prompt is open to temporarily hide/show the popup so you can read prior agent output, then press it again to bring it back
+- Local Pi notification every time an `ask_user` prompt opens
+- Telegram notifications for `ask_user` prompts, delayed by 60 seconds so quick local answers suppress the Telegram message
+- A/B/C-style Telegram quick-reply buttons and reply-to-message answers for prompts
+- Telegram idle notifications on `agent_end`, also delayed by 60 seconds and cancelled if the user responds first
 - Pi-TUI-aligned keybinding and editor behavior
 - Custom TUI rendering for tool calls and results
 - System prompt integration via `promptSnippet` and `promptGuidelines`
@@ -41,12 +45,12 @@ The skill follows a "decision handshake" flow:
 3. Wait for explicit user choice
 4. Confirm the decision, then proceed
 
-See: `skills/ask-user/references/ask-user-skill-extension-spec.md`.
+See the bundled skill reference under `skills/ask-user/references/`.
 
 ## Install
 
 ```bash
-pi install npm:pi-ask-user
+pi install npm:pi-telegram-notify
 ```
 
 ## Tool name
@@ -118,6 +122,28 @@ Effective order for both `overlayToggleKey` and `commentToggleKey`:
 3. Built-in defaults: `alt+o` and `ctrl+g`
 
 Pass `"off"`, `"none"`, or `"disabled"` (at any level) to disable the shortcut entirely. Invalid specs are silently dropped and the next source is used. Specs follow the Pi-TUI [`KeyId`](https://github.com/earendil-works/pi-mono/blob/main/packages/tui/src/keys.ts) format: `[mod+]...key` where modifiers are `ctrl`, `shift`, `alt`, `super`, in any order, joined by `+` (e.g. `ctrl+g`, `alt+shift+x`, `escape`, `tab`).
+
+### Telegram notifications
+
+Add top-level `telegram` settings to `~/.pi/agent/settings.json`:
+
+```json
+{
+  "telegram": {
+    "botToken": "123456:replace-with-your-bot-token",
+    "chatId": "123456789"
+  }
+}
+```
+
+When both settings are present, `pi-telegram-notify` sends:
+
+- `ask_user` prompt notifications after a 60-second grace period. If the prompt is answered locally before that minute elapses, no Telegram message is sent.
+- Agent idle notifications on Pi's `agent_end` event after the same 60-second grace period. If the user responds or a new turn starts before then, no Telegram message is sent.
+
+The `ask_user` Telegram message includes the question, context, options/descriptions, and inline quick-reply buttons labelled `A`, `B`, `C`, etc. The internal request id is hidden in Telegram `callback_data`, not printed in the message. Pressing an option button answers the matching prompt. You can also reply to the Telegram message with an option letter/title; for multi-select prompts, reply with comma-separated letters such as `A,C`. If `allowComment` is enabled, include a comment as `A - your comment` (or `A,C - your comment`). If `allowFreeform` is enabled, Telegram also shows a `Custom answer` button that prompts you to reply with custom text.
+
+Multiple prompts can be open at the same time: each Telegram callback/reply is correlated by hidden request id and Telegram message id so the answer returns to the correct `ask_user` call. After an answer is accepted, the original Telegram prompt is edited to show `✅ Answered` and the selected/custom response, with quick-reply buttons removed. Idle notifications that were already sent are edited to show that the session resumed. Coordination state is shared through a token-hashed temp directory with a single polling lock, so separate Pi sessions using the same bot/chat do not race each other with competing `getUpdates` offsets. If either setting is missing, Telegram integration is disabled and the local Pi UI continues to work normally. Tokens are only read from the settings file and are not printed in warnings.
 
 ## Controls
 

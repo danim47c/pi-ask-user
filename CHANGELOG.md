@@ -1,6 +1,14 @@
 # Changelog
 
-## [0.11.1](https://github.com/edlsh/pi-ask-user/releases/tag/v0.11.1) - 2026-05-23
+## Unreleased
+
+### Added
+
+- Local Pi notifications when an `ask_user` prompt opens.
+- Optional Telegram notifications configured in `~/.pi/agent/settings.json` under top-level `telegram.botToken` and `telegram.chatId`; ask prompts are delayed by 60 seconds, suppressed when answered locally before then, include the full prompt, hidden request IDs in callback data, A/B/C-style quick-reply buttons, custom-answer prompts, selection comments in reply text, reply-to-message handling, answer-state message edits, and request correlation for simultaneous prompts across independent Pi sessions via shared token-hashed temp state and a single polling lock.
+- Telegram notifications when the Pi agent reaches `agent_end`/idle, also delayed by 60 seconds, suppressed if the user responds before then, and edited as resumed if already sent.
+
+## [0.11.1](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.11.1) - 2026-05-23
 
 ### Fixed
 
@@ -10,19 +18,19 @@
 
 - Tightened `peerDependencies` on `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` from `"*"` to `">=0.74.0"` so npm refuses to install this version against legacy `@mariozechner/*` hosts at install time instead of crashing at render time
 
-## [0.11.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.11.0) - 2026-05-09
+## [0.11.0](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.11.0) - 2026-05-09
 
 ### Added
 
 - Vim-style navigation aliases for option lists: `ctrl+j` moves to the next option and `ctrl+k` moves to the previous option in both single-select (with active fuzzy search) and multi-select prompts. Bare `j`/`k` continue to feed the fuzzy filter so search behavior is unchanged. Closes #16.
 
-## [0.10.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.10.0) - 2026-05-07
+## [0.10.0](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.10.0) - 2026-05-07
 
 ### Changed
 
 - Updated peer dependencies and references for the move to `earendil-works/pi-mono` and `@earendil-works/*` package scopes. `@mariozechner/pi-coding-agent` and `@mariozechner/pi-tui` peer deps are now `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui`.
 
-## [0.9.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.9.0) - 2026-05-04
+## [0.9.0](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.9.0) - 2026-05-04
 
 ### Added
 
@@ -31,13 +39,13 @@
 - Pass `"off"`, `"none"`, or `"disabled"` at any level to disable a shortcut entirely; invalid specs silently fall through to the next source
 - Defaults preserved: existing `alt+o` overlay-toggle and `ctrl+g` comment-toggle continue to work unchanged. Closes #13.
 
-## [0.8.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.8.0) - 2026-05-01
+## [0.8.0](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.8.0) - 2026-05-01
 
 ### Added
 
 - Runtime overlay toggle: in `overlay` mode, press `alt+o` while the prompt is open to temporarily hide/show the popup so you can read prior agent output. Press again to restore. Implemented via `OverlayHandle.setHidden()` and a global `ctx.ui.onTerminalInput` listener so the overlay can be revived even while hidden. A one-shot info notification on first hide reminds the user how to restore. Closes #11.
 
-## [0.7.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.7.0) - 2026-05-01
+## [0.7.0](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.7.0) - 2026-05-01
 
 ### Added
 
@@ -49,13 +57,13 @@
 
 - Tool schema now uses a flat `{ type: "string", enum: [...] }` JSON Schema for `displayMode` (Google function-calling compatible) via a small local helper rather than `Type.Union([Type.Literal()])`
 
-## [0.6.1](https://github.com/edlsh/pi-ask-user/releases/tag/v0.6.1) - 2026-04-07
+## [0.6.1](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.6.1) - 2026-04-07
 
 ### Changed
 
 - Clarified the registered `ask_user` tool guidance so agents are instructed to ask exactly one focused question per call and avoid multipart or unrelated prompts
 
-## [0.6.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.6.0) - 2026-04-07
+## [0.6.0](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.6.0) - 2026-04-07
 
 ### Added
 
@@ -67,7 +75,7 @@
 - Expanded result rendering now shows selection comments separately from chosen options
 
 
-## [0.5.2](https://github.com/edlsh/pi-ask-user/releases/tag/v0.5.2) - 2026-04-06
+## [0.5.2](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.5.2) - 2026-04-06
 
 ### Fixed
 
@@ -77,7 +85,7 @@
 
 - `renderSingleSelectRows()` now returns `AnnotatedRow[]` (`{ line, selected }`) instead of plain strings, enabling callers to apply per-block styling
 
-## [0.5.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.5.0) - 2026-03-25
+## [0.5.0](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.5.0) - 2026-03-25
 
 ### Added
 
@@ -98,7 +106,7 @@
 - Exact-width word wrapping no longer duplicates preceding short text in wrapped descriptions
 
 
-## [0.4.1](https://github.com/edlsh/pi-ask-user/releases/tag/v0.4.1) - 2026-03-22
+## [0.4.1](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.4.1) - 2026-03-22
 
 ### Added
 
@@ -123,42 +131,42 @@
 - Keep the ask overlay accessible on narrow terminals by removing the visibility gate that could leave prompts hidden and unresolved
 - Render partial `ask_user` updates as a waiting state instead of a successful empty answer, and correctly mark selected options in expanded multi-select results
 
-## [0.4.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.4.0) - 2026-03-22
+## [0.4.0](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.4.0) - 2026-03-22
 
 ### Changed
 
-- Replace pi-tui `SelectList` with custom `WrappedSingleSelectList` that wraps long option titles and descriptions instead of truncating them ([`7a4c239`](https://github.com/edlsh/pi-ask-user/commit/7a4c239))
-- Configure centered overlay at 92% width / 85% max height with dynamic row calculation based on terminal size ([`7a4c239`](https://github.com/edlsh/pi-ask-user/commit/7a4c239))
+- Replace pi-tui `SelectList` with custom `WrappedSingleSelectList` that wraps long option titles and descriptions instead of truncating them ([`7a4c239`](https://github.com/edlsh/pi-telegram-notify/commit/7a4c239))
+- Configure centered overlay at 92% width / 85% max height with dynamic row calculation based on terminal size ([`7a4c239`](https://github.com/edlsh/pi-telegram-notify/commit/7a4c239))
 
 ### Added
 
-- `single-select-layout.ts` — pure rendering logic with text wrapping, numbered items, viewport scrolling, and position indicators ([`7a4c239`](https://github.com/edlsh/pi-ask-user/commit/7a4c239))
+- `single-select-layout.ts` — pure rendering logic with text wrapping, numbered items, viewport scrolling, and position indicators ([`7a4c239`](https://github.com/edlsh/pi-telegram-notify/commit/7a4c239))
 
-## [0.3.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.3.0) - 2026-03-13
+## [0.3.0](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.3.0) - 2026-03-13
 
 ### Added
 
-- `promptSnippet` for inline prompt integration ([`c9e0df0`](https://github.com/edlsh/pi-ask-user/commit/c9e0df0))
-- `renderCall` / `renderResult` hooks for custom tool-call rendering ([`c9e0df0`](https://github.com/edlsh/pi-ask-user/commit/c9e0df0))
-- Overlay mode for the ask UI ([`c9e0df0`](https://github.com/edlsh/pi-ask-user/commit/c9e0df0))
-- Timeout support with auto-dismiss ([`c9e0df0`](https://github.com/edlsh/pi-ask-user/commit/c9e0df0))
-- Structured details in tool results ([`c9e0df0`](https://github.com/edlsh/pi-ask-user/commit/c9e0df0))
+- `promptSnippet` for inline prompt integration ([`c9e0df0`](https://github.com/edlsh/pi-telegram-notify/commit/c9e0df0))
+- `renderCall` / `renderResult` hooks for custom tool-call rendering ([`c9e0df0`](https://github.com/edlsh/pi-telegram-notify/commit/c9e0df0))
+- Overlay mode for the ask UI ([`c9e0df0`](https://github.com/edlsh/pi-telegram-notify/commit/c9e0df0))
+- Timeout support with auto-dismiss ([`c9e0df0`](https://github.com/edlsh/pi-telegram-notify/commit/c9e0df0))
+- Structured details in tool results ([`c9e0df0`](https://github.com/edlsh/pi-telegram-notify/commit/c9e0df0))
 
-## [0.2.1](https://github.com/edlsh/pi-ask-user/releases/tag/v0.2.1) - 2026-02-16
+## [0.2.1](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.2.1) - 2026-02-16
 
 ### Fixed
 
-- Documentation improvements — moved demo section to top of README, simplified skill spec ([`e2f6a57`](https://github.com/edlsh/pi-ask-user/commit/e2f6a57), [`e09d130`](https://github.com/edlsh/pi-ask-user/commit/e09d130), [`0fc7f99`](https://github.com/edlsh/pi-ask-user/commit/0fc7f99))
+- Documentation improvements — moved demo section to top of README, simplified skill spec ([`e2f6a57`](https://github.com/edlsh/pi-telegram-notify/commit/e2f6a57), [`e09d130`](https://github.com/edlsh/pi-telegram-notify/commit/e09d130), [`0fc7f99`](https://github.com/edlsh/pi-telegram-notify/commit/0fc7f99))
 
-## [0.2.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.2.0) - 2026-02-16
-
-### Added
-
-- Bundled ask-user decision-gate skill ([`38add68`](https://github.com/edlsh/pi-ask-user/commit/38add68))
-- npm publish CI workflow ([`da10d70`](https://github.com/edlsh/pi-ask-user/commit/da10d70))
-
-## [0.1.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.1.0) - 2026-02-16
+## [0.2.0](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.2.0) - 2026-02-16
 
 ### Added
 
-- Initial public release — interactive `ask_user` tool with multi-select and freeform input UI ([`9077284`](https://github.com/edlsh/pi-ask-user/commit/9077284))
+- Bundled ask-user decision-gate skill ([`38add68`](https://github.com/edlsh/pi-telegram-notify/commit/38add68))
+- npm publish CI workflow ([`da10d70`](https://github.com/edlsh/pi-telegram-notify/commit/da10d70))
+
+## [0.1.0](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.1.0) - 2026-02-16
+
+### Added
+
+- Initial public release — interactive `ask_user` tool with multi-select and freeform input UI ([`9077284`](https://github.com/edlsh/pi-telegram-notify/commit/9077284))
