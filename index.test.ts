@@ -8,7 +8,7 @@ import {
 	test,
 } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1020,6 +1020,95 @@ describe("ask_user", () => {
 			await expect(genericPoller.sendNotificationMessage("hello")).rejects.toThrow("message thread rejected");
 			expect(calls.filter((call) => call.method === "sendRichMessage")).toHaveLength(1);
 			expect(calls.filter((call) => call.method === "createForumTopic")).toHaveLength(0);
+		});
+			test("uses session identity for topic creation, resume, legacy maps, and dynamic names", async () => {
+			const lease = await hooks();
+			const config = { botToken: "session-topic-identity", chatId: "4242", apiBaseUrl: "https://telegram.test" };
+			const store = lease.storeForConfig(config);
+			rmSync(store.rootDir, { recursive: true, force: true });
+			const calls: Array<{ method: string; body: any }> = [];
+			let thread = 10;
+			stubFetch((url, init) => {
+				const method = url.split("/").pop()!; const body = jsonBody(init); calls.push({ method, body });
+				if (method === "getMe") return telegramOk({ has_topics_enabled: true });
+				if (method === "createForumTopic") return telegramOk({ message_thread_id: thread++ });
+				return telegramOk({ message_id: thread });
+			});
+			const a = lease.createPoller(config); a.setRouting({ sessionId: "session-alpha-123", getSessionName: () => "Named session", cwd: process.cwd() });
+			const b = lease.createPoller(config); b.setRouting({ sessionId: "session-beta-456", cwd: process.cwd() });
+			await a.sendNotificationMessage("a"); await b.sendNotificationMessage("b");
+			const resumed = lease.createPoller(config); resumed.setRouting({ sessionId: "session-alpha-123", cwd: process.cwd() });
+			await resumed.sendNotificationMessage("again");
+			const created = calls.filter((call) => call.method === "createForumTopic");
+			expect(created).toHaveLength(2);
+			expect(created.map((call) => call.body.name)).toEqual(["pi-ask-user · Named session", "pi-ask-user · session-"]);
+			let map: any;
+			try { map = JSON.parse(readFileSync(store.topicFile, "utf8")); } catch { throw new Error("topic map was not valid JSON"); }
+			expect(map.threads[String(map.topics["session-alpha-123"].threadId)]).toBe("session-alpha-123");
+			writeFileSync(store.topicFile, JSON.stringify({ version: 1, topics: { legacy: 77 }, threads: { "77": "legacy" } }));
+			const legacy = lease.createPoller(config); legacy.setRouting({ sessionId: "legacy", cwd: process.cwd() });
+			await legacy.sendNotificationMessage("replace legacy");
+			expect(calls.filter((call) => call.method === "createForumTopic")).toHaveLength(3);
+			const resolved = await lease.resolveTopicName("abcdef123", undefined, process.cwd());
+			expect(resolved).toBe("pi-ask-user · abcdef12");
+		});
+
+		test("routes free topic text once, preserves ask precedence, and reacts using inbound ids", async () => {
+			const lease = await hooks();
+			const config = { botToken: "session-inbound-routing", chatId: "4242", apiBaseUrl: "https://telegram.test" };
+			const store = lease.storeForConfig(config); rmSync(store.rootDir, { recursive: true, force: true });
+			const calls: Array<{ method: string; body: any }> = [];
+			stubFetch((url, init) => {
+				const method = url.split("/").pop()!; const body = jsonBody(init); calls.push({ method, body });
+				if (method === "getUpdates") return new Promise<Response>((resolve) => (init?.signal as AbortSignal | undefined)?.addEventListener("abort", () => resolve(telegramOk([])), { once: true }));
+				if (method === "getMe") return telegramOk({ has_topics_enabled: true });
+				if (method === "createForumTopic") return telegramOk({ message_thread_id: 31 });
+				return telegramOk({ message_id: 1 });
+			});
+			const delivered: string[] = [];
+			const poller = lease.createPoller(config);
+			poller.setRouting({ sessionId: "inbound-session", cwd: process.cwd() });
+			await poller.sendNotificationMessage("create topic");
+			await poller.activateSession({ sessionId: "inbound-session", cwd: process.cwd() }, async (text: string) => { delivered.push(text); return delivered.length === 1 ? "idle" : "followUp"; });
+			await lease.handleUpdate(poller, { update_id: 501, message: { message_id: 91, message_thread_id: 31, chat: { id: 4242 }, text: "first" } });
+			await lease.consumeInbox(poller);
+			await lease.handleUpdate(poller, { update_id: 502, message: { message_id: 92, message_thread_id: 31, chat: { id: 4242 }, text: "second" } });
+			await lease.consumeInbox(poller);
+			expect(delivered).toEqual(["first", "second"]);
+			expect(calls.filter((call) => call.method === "setMessageReaction").map((call) => [call.body.message_id, call.body.reaction[0].emoji])).toEqual([[91, "👀"], [91, "✅"], [92, "👀"], [92, "⏳"]]);
+			await poller.createPendingAsk({ id: "ask", request: { question: "q", options: [], allowFreeform: true, allowMultiple: false, allowComment: false }, createdAt: Date.now(), updatedAt: Date.now(), status: "pending", messageId: 93, messageThreadId: 31 });
+			await lease.handleUpdate(poller, { update_id: 503, message: { message_id: 94, message_thread_id: 31, chat: { id: 4242 }, reply_to_message: { message_id: 93 }, text: "answer" } });
+			expect(delivered).toEqual(["first", "second"]);
+			await poller.removePendingAsk("ask");
+			await lease.handleUpdate(poller, { update_id: 503, message: { message_id: 94, message_thread_id: 31, chat: { id: 4242 }, text: "replay" } });
+			expect(delivered).toEqual(["first", "second"]);
+			await poller.deactivateSession();
+		});
+
+		test("keeps fresh owners fenced and lets a stale replacement recover queued inbox", async () => {
+			const lease = await hooks();
+			const config = { botToken: "session-owner-recovery", chatId: "4242", apiBaseUrl: "https://telegram.test" };
+			const store = lease.storeForConfig(config); rmSync(store.rootDir, { recursive: true, force: true });
+			stubFetch((url, init) => {
+				const method = url.split("/").pop()!;
+				if (method === "getUpdates") return new Promise<Response>((resolve) => (init?.signal as AbortSignal | undefined)?.addEventListener("abort", () => resolve(telegramOk([])), { once: true }));
+				return telegramOk({ has_topics_enabled: true, message_id: 1 });
+			});
+			const first: string[] = []; const second: string[] = [];
+			const a = lease.createPoller(config); await a.activateSession({ sessionId: "same", cwd: process.cwd() }, async (text: string) => { first.push(text); return "idle"; });
+			const b = lease.createPoller(config); await b.activateSession({ sessionId: "same", cwd: process.cwd() }, async (text: string) => { second.push(text); return "idle"; });
+			await lease.handleUpdate(a, { update_id: 601, message: { message_id: 1, message_thread_id: 99, chat: { id: 4242 }, text: "ignored" } });
+			expect(first).toEqual([]); expect(second).toEqual([]);
+			const registrationFile = join(store.registrationsDir, readdirSync(store.registrationsDir)[0]!);
+			let registration: any;
+			try { registration = JSON.parse(readFileSync(registrationFile, "utf8")); } catch { throw new Error("registration was not valid JSON"); }
+			writeFileSync(registrationFile, JSON.stringify({ ...registration, heartbeatAt: Date.now() - 71_000 }));
+			await b.activateSession({ sessionId: "same", cwd: process.cwd() }, async (text: string) => { second.push(text); return "idle"; });
+			const inbox = join(store.inboxDir, createHash("sha256").update("same").digest("hex")); mkdirSync(inbox, { recursive: true });
+			writeFileSync(join(inbox, "602.json"), JSON.stringify({ updateId: 602, text: "recovered", messageId: 2, threadId: 99, createdAt: Date.now() }));
+			await lease.consumeInbox(b);
+			expect(second).toEqual(["recovered"]);
+			await a.deactivateSession(); await b.deactivateSession();
 		});
 	});
 

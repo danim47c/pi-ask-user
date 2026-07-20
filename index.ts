@@ -1252,7 +1252,10 @@ class TelegramBotPoller {
 
 	async activateSession(routing: { sessionId: string; sessionName?: string; getSessionName?: () => string | undefined; cwd: string }, deliver: (text: string) => Promise<"idle" | "followUp">): Promise<void> {
 		this.setRouting(routing);
-		const instanceId = telegramLeaseToken();
+		// Repeated session_start events for this live poller retain its ownership token.
+		const instanceId = this.localSession?.sessionId === routing.sessionId
+			? this.localSession.instanceId
+			: telegramLeaseToken();
 		const register = async () => {
 			await withTelegramTopicLock(this.store, async () => {
 				const path = registrationPath(this.store, routing.sessionId);
@@ -3709,6 +3712,9 @@ export const __telegramTestHooks = {
 	setLeaseBarrier: (barrier: typeof telegramLeaseTestBarrier) => { telegramLeaseTestBarrier = barrier; },
 	createPoller: (config: TelegramConfig) => new TelegramBotPoller(config),
 	storeForConfig: createTelegramSharedStore,
+	resolveTopicName: resolveTelegramTopicName,
+	handleUpdate: async (poller: TelegramBotPoller, update: TelegramUpdate) => await (poller as unknown as { handleUpdate: (value: TelegramUpdate) => Promise<void> }).handleUpdate(update),
+	consumeInbox: async (poller: TelegramBotPoller) => await (poller as unknown as { consumeInbox: () => Promise<void> }).consumeInbox(),
 };
 
 export default function (pi: ExtensionAPI) {
