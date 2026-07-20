@@ -870,23 +870,117 @@ describe("ask_user", () => {
 			await replacement!.release();
 		});
 
-		test("publishes a complete owner before the lock becomes visible", async () => {
+		test("removes a provisional fence when a refreshed owner makes reclaim abort", async () => {
 			const lease = await hooks();
-			const lockDir = testLock("atomic-publication");
-			const lock = await lease.tryAcquireLease(lockDir, 10_000);
-			expect(await lease.readLeaseOwner(lockDir)).toMatchObject({ token: expect.any(String), heartbeatAt: expect.any(Number) });
-			await lock!.release();
+			const lockDir = testLock("refresh-during-reclaim");
+			const a = await lease.tryAcquireLease(lockDir, 100);
+			const owner = await lease.readLeaseOwner(lockDir);
+			writeFileSync(join(lease.leasePath(lockDir, owner.token), "owner.json"), JSON.stringify({ ...owner, heartbeatAt: Date.now() - 1_000 }));
+			let resume!: () => void;
+			const reserved = new Promise<void>((resolve) => { resume = resolve; });
+			lease.setLeaseBarrier(async (phase: string) => { if (phase === "reserved") await reserved; });
+			try {
+				const reclaim = lease.tryAcquireLease(lockDir, 100);
+				await waitUntil(() => existsSync(lease.tombstonePath(lockDir, owner.token)));
+				await a!.refresh();
+				resume();
+				expect(await reclaim).toBeNull();
+				expect(existsSync(lease.tombstonePath(lockDir, owner.token))).toBe(false);
+				const b = await lease.tryAcquireLease(lockDir, 100);
+				expect(b).toBeNull(); // A is fresh after the aborted reclaim.
+				const refreshed = await lease.readLeaseOwner(lockDir);
+				writeFileSync(join(lease.leasePath(lockDir, refreshed.token), "owner.json"), JSON.stringify({ ...refreshed, heartbeatAt: Date.now() - 1_000 }));
+				expect(await lease.tryAcquireLease(lockDir, 100)).toBeNull();
+				const c = await lease.tryAcquireLease(lockDir, 100);
+				expect(c).not.toBeNull(); // A later becomes stale and B can acquire.
+				await c!.release();
+			} finally { lease.setLeaseBarrier(undefined); }
 		});
 
-		test("keeps a newer topic ID and only retries explicit topic-not-found errors", async () => {
+		test("synchronizes competing reclaimers without letting either retire B", async () => {
 			const lease = await hooks();
-			const topicFile = join(testLock("topic-invalidation"), "topics.json");
-			mkdirSync(join(topicFile, ".."), { recursive: true });
-			writeFileSync(topicFile, JSON.stringify({ topics: { project: 22 } }));
-			await lease.invalidateTopicMap(topicFile, "project", 11);
-			expect(readFileSync(topicFile, "utf8")).toBe(JSON.stringify({ topics: { project: 22 } }));
-			expect(lease.isInvalidTopicDescription("Bad Request: message thread was not found")).toBe(true);
-			expect(lease.isInvalidTopicDescription("Bad Request: request failed")).toBe(false);
+			const lockDir = testLock("synchronized-reclaimers");
+			const a = await lease.tryAcquireLease(lockDir, -1);
+			let resume!: () => void;
+			const pause = new Promise<void>((resolve) => { resume = resolve; });
+			let paused = false;
+			lease.setLeaseBarrier(async (phase: string) => { if (phase === "beforeRename" && !paused) { paused = true; await pause; } });
+			try {
+				const first = lease.tryAcquireLease(lockDir, -1);
+				await waitUntil(() => paused);
+				const second = lease.tryAcquireLease(lockDir, -1);
+				resume();
+				await Promise.all([first, second]);
+				expect(await lease.tryAcquireLease(lockDir, -1)).toBeNull();
+				const b = await lease.tryAcquireLease(lockDir, -1);
+				expect(b).not.toBeNull();
+				await a!.release();
+				expect(await lease.readLeaseOwner(lockDir)).toMatchObject({ token: expect.any(String) });
+				await b!.release();
+			} finally { lease.setLeaseBarrier(undefined); }
+		});
+
+		test("publishes only pointers whose owner payload is initialized", async () => {
+			const lease = await hooks();
+			const lockDir = testLock("atomic-publication");
+			let releaseReturn!: () => void;
+			const returnPaused = new Promise<void>((resolve) => { releaseReturn = resolve; });
+			let published = false;
+			lease.setLeaseBarrier(async (phase: string) => {
+				if (phase === "published") { published = true; await returnPaused; }
+			});
+			try {
+				const acquiring = lease.tryAcquireLease(lockDir, 10_000);
+				await waitUntil(() => published);
+				// The fixed pointer is visible while acquire is still blocked; every
+				// such observation must resolve to a complete immutable owner payload.
+				expect(await lease.readLeaseOwner(lockDir)).toMatchObject({ token: expect.any(String), heartbeatAt: expect.any(Number) });
+				releaseReturn();
+				const lock = await acquiring;
+				await lock!.release();
+			} finally { lease.setLeaseBarrier(undefined); }
+		});
+
+		test("Telegram send retries only explicit missing-topic errors and preserves newer mappings", async () => {
+			const lease = await hooks();
+			const config = { botToken: "topic-send-test", chatId: "4242", apiBaseUrl: "https://telegram.test" };
+			const store = lease.storeForConfig(config);
+			rmSync(store.rootDir, { recursive: true, force: true });
+			const calls: Array<{ method: string; body: any }> = [];
+			let topic = 11;
+			stubFetch((url, init) => {
+				const method = url.split("/").pop()!;
+				const body = jsonBody(init); calls.push({ method, body });
+				if (method === "getMe") return telegramOk({ has_topics_enabled: true });
+				if (method === "createForumTopic") return telegramOk({ message_thread_id: topic++ });
+				if (method === "sendRichMessage" && body.message_thread_id === 11) {
+					const key = createHash("sha256").update("pi-ask-user").digest("hex");
+					writeFileSync(store.topicFile, JSON.stringify({ topics: { [key]: 99 } }));
+					return new Response(JSON.stringify({ ok: false, description: "Bad Request: message thread was not found" }), { status: 400 });
+				}
+				if (method === "sendRichMessage") return telegramOk({ message_id: 7 });
+				return telegramOk({});
+			});
+			const poller = lease.createPoller(config);
+			await poller.sendNotificationMessage("hello");
+			expect(calls.filter((call) => call.method === "sendRichMessage").map((call) => call.body.message_thread_id)).toEqual([11, 99]);
+			const key = createHash("sha256").update("pi-ask-user").digest("hex");
+			expect(readFileSync(store.topicFile, "utf8")).toContain(`"${key}":99`);
+			calls.length = 0;
+			const genericConfig = { ...config, botToken: "generic-send-test" };
+			const genericStore = lease.storeForConfig(genericConfig);
+			mkdirSync(genericStore.rootDir, { recursive: true });
+			writeFileSync(genericStore.topicFile, JSON.stringify({ topics: { [key]: 33 } }));
+			stubFetch((url, init) => {
+				const method = url.split("/").pop()!; calls.push({ method, body: jsonBody(init) });
+				if (method === "getMe") return telegramOk({ has_topics_enabled: true });
+				if (method === "createForumTopic") return telegramOk({ message_thread_id: 33 });
+				if (method === "sendRichMessage") return new Response(JSON.stringify({ ok: false, description: "Bad Request: message thread rejected" }), { status: 400 });
+				return telegramOk({});
+			});
+			await expect(lease.createPoller(genericConfig).sendNotificationMessage("hello")).rejects.toThrow("message thread rejected");
+			expect(calls.filter((call) => call.method === "sendRichMessage")).toHaveLength(1);
+			expect(calls.filter((call) => call.method === "createForumTopic")).toHaveLength(0);
 		});
 	});
 

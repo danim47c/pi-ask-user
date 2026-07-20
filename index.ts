@@ -1039,6 +1039,9 @@ function telegramLeaseTombstone(lockDir: string, token: string): string {
 	return `${lockDir}.tombstone.${token}`;
 }
 
+/** Test-only synchronization seam for deterministic lease race tests. */
+let telegramLeaseTestBarrier: ((phase: "reserved" | "beforeRename" | "beforePublish" | "published") => Promise<void> | void) | undefined;
+
 /**
  * A tombstone directory is a permanent, token-specific compare-and-swap fence.
  * Its payload may be collected, but the directory itself must remain: deleting
@@ -1051,16 +1054,25 @@ async function retireTelegramLease(lockDir: string, owner: TelegramLeaseOwner, s
 		if (isErrno(error, "EEXIST")) return false;
 		throw error;
 	}
+	let renamed = false;
 	try {
+		await telegramLeaseTestBarrier?.("reserved");
 		const current = await readJsonFile<TelegramLeaseOwner>(join(lockDir, "owner.json"));
 		if (current?.token !== owner.token || (staleMs !== undefined && Date.now() - current.heartbeatAt < staleMs)) return false;
+		await telegramLeaseTestBarrier?.("beforeRename");
 		// We exclusively own this token's destination.  No other compliant actor
 		// can remove this pointer before us, so rename cannot target a replacement.
 		await rename(lockDir, join(tombstone, "pointer"));
+		renamed = true;
 		return true;
 	} catch (error) {
 		if (isErrno(error, "ENOENT")) return false;
 		throw error;
+	} finally {
+		// A token-specific directory was created by this attempt.  It is a permanent
+		// fence only once its pointer rename commits; otherwise it must not block a
+		// later stale incarnation of the same lease.
+		if (!renamed) await rm(tombstone, { recursive: true, force: true });
 	}
 }
 
@@ -1094,6 +1106,7 @@ async function tryAcquireTelegramLease(lockDir: string, staleMs: number): Promis
 	await mkdir(leaseDir, { mode: 0o700 });
 	await writeJsonFileAtomic(leaseOwnerFile, { token, pid: process.pid, heartbeatAt: Date.now() });
 	try {
+		await telegramLeaseTestBarrier?.("beforePublish");
 		// A symlink is the sole mutable ownership pointer.  It is published only
 		// after its target has a complete owner record, so readers never see an
 		// initialized-but-ownerless stale window.
@@ -1105,6 +1118,7 @@ async function tryAcquireTelegramLease(lockDir: string, staleMs: number): Promis
 		if (owner) await reclaimTelegramLease(lockDir, owner, staleMs);
 		return null;
 	}
+	await telegramLeaseTestBarrier?.("published");
 	let released = false;
 	return {
 		refresh: async () => {
@@ -3528,6 +3542,9 @@ export const __telegramTestHooks = {
 	tombstonePath: telegramLeaseTombstone,
 	invalidateTopicMap: invalidateTelegramTopicMap,
 	isInvalidTopicDescription: (description: string) => isInvalidTopic(new TelegramApiError(400, description)),
+	setLeaseBarrier: (barrier: typeof telegramLeaseTestBarrier) => { telegramLeaseTestBarrier = barrier; },
+	createPoller: (config: TelegramConfig) => new TelegramBotPoller(config),
+	storeForConfig: createTelegramSharedStore,
 };
 
 export default function (pi: ExtensionAPI) {
