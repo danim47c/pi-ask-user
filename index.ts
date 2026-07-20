@@ -1040,7 +1040,7 @@ function telegramLeaseTombstone(lockDir: string, token: string): string {
 }
 
 /** Test-only synchronization seam for deterministic lease race tests. */
-let telegramLeaseTestBarrier: ((phase: "reserved" | "beforeRename" | "beforePublish" | "published") => Promise<void> | void) | undefined;
+let telegramLeaseTestBarrier: ((phase: "reserved" | "tombstoneExists" | "beforeRename" | "beforePublish" | "published") => Promise<void> | void) | undefined;
 
 /**
  * A tombstone directory is a permanent, token-specific compare-and-swap fence.
@@ -1051,7 +1051,10 @@ async function retireTelegramLease(lockDir: string, owner: TelegramLeaseOwner, s
 	if (staleMs !== undefined && Date.now() - owner.heartbeatAt < staleMs) return false;
 	const tombstone = telegramLeaseTombstone(lockDir, owner.token);
 	try { await mkdir(tombstone, { mode: 0o700 }); } catch (error) {
-		if (isErrno(error, "EEXIST")) return false;
+		if (isErrno(error, "EEXIST")) {
+			await telegramLeaseTestBarrier?.("tombstoneExists");
+			return false;
+		}
 		throw error;
 	}
 	let renamed = false;
