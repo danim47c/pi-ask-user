@@ -245,6 +245,7 @@ interface TelegramSharedStore {
 	topicLockDir: string;
 	registrationsDir: string;
 	inboxDir: string;
+	updatesDir: string;
 }
 
 interface TelegramPollLock {
@@ -460,6 +461,7 @@ function createTelegramSharedStore(
 		topicLockDir: join(rootDir, "topics.lock"),
 		registrationsDir: join(rootDir, "registrations"),
 		inboxDir: join(rootDir, "inbox"),
+		updatesDir: join(rootDir, "updates"),
 	};
 }
 
@@ -539,8 +541,9 @@ function buildBoundedTelegramHtml(parts: TelegramHtmlPart[], maxLength = TELEGRA
 
 async function resolveTelegramTopicName(sessionId: string, sessionName?: string, cwd = process.cwd()): Promise<string | null> {
 	try {
-		const { stdout } = await execFileAsync("git", ["-C", cwd, "rev-parse", "--show-toplevel"]);
-		const repository = basename(stdout.trim()) || "repository";
+		// The common git directory belongs to the main repository even when cwd is a linked worktree.
+		const { stdout } = await execFileAsync("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
+		const repository = basename(dirname(stdout.trim())) || "repository";
 		const name = sessionName?.trim() || sessionId.slice(0, 8);
 		return truncatePlainText(`${repository} · ${name}`, 128);
 	} catch {
@@ -895,6 +898,28 @@ async function ensureTelegramStoreDirs(
 	await mkdir(store.pendingDir, { recursive: true, mode: 0o700 });
 }
 
+// This is deliberately written before any update side effect. Telegram can replay
+// updates after an offset write failure; at-most-once loss is safer than duplicate Pi input.
+async function claimTelegramUpdate(store: TelegramSharedStore, updateId: number): Promise<boolean> {
+	await mkdir(store.updatesDir, { recursive: true, mode: 0o700 });
+	const path = join(store.updatesDir, `${updateId}.claimed`);
+	try {
+		await writeFile(path, `${Date.now()}\n`, { flag: "wx", mode: 0o600 });
+	} catch (error) {
+		if (isErrno(error, "EEXIST")) return false;
+		throw error;
+	}
+	// Bounded retention, beyond Telegram's replay horizon. Best effort only.
+	const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1_000;
+	try {
+		for (const entry of await readdir(store.updatesDir)) {
+			const candidate = join(store.updatesDir, entry);
+			if ((await stat(candidate)).mtimeMs < cutoff) await rm(candidate, { force: true });
+		}
+	} catch { /* claim remains durable if cleanup races or fails */ }
+	return true;
+}
+
 function sharedAskPath(store: TelegramSharedStore, id: string): string {
 	return join(store.pendingDir, `${id}.json`);
 }
@@ -1149,7 +1174,7 @@ function topicBinding(map: TelegramTopicMap, sessionId: string): TelegramTopicBi
 	return typeof value === "number" ? undefined : value;
 }
 function registrationPath(store: TelegramSharedStore, sessionId: string): string { return join(store.registrationsDir, `${createHash("sha256").update(sessionId).digest("hex")}.json`); }
-function inboxPath(store: TelegramSharedStore, instanceId: string, updateId: number): string { return join(store.inboxDir, instanceId, `${updateId}.json`); }
+function inboxPath(store: TelegramSharedStore, sessionId: string, updateId: number): string { return join(store.inboxDir, createHash("sha256").update(sessionId).digest("hex"), `${updateId}.json`); }
 async function listLiveRegistrations(store: TelegramSharedStore): Promise<TelegramSessionRegistration[]> {
 	await mkdir(store.registrationsDir, { recursive: true, mode: 0o700 });
 	const entries = await readdir(store.registrationsDir);
@@ -1163,8 +1188,8 @@ async function listLiveRegistrations(store: TelegramSharedStore): Promise<Telegr
 	}
 	return result;
 }
-async function enqueueTelegramInbox(store: TelegramSharedStore, instanceId: string, envelope: TelegramInboxEnvelope): Promise<boolean> {
-	const path = inboxPath(store, instanceId, envelope.updateId);
+async function enqueueTelegramInbox(store: TelegramSharedStore, sessionId: string, envelope: TelegramInboxEnvelope): Promise<boolean> {
+	const path = inboxPath(store, sessionId, envelope.updateId);
 	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 	try { await writeFile(path, `${JSON.stringify(envelope)}\n`, { flag: "wx", mode: 0o600 }); return true; }
 	catch (error) { if (isErrno(error, "EEXIST")) return false; throw error; }
@@ -1211,7 +1236,7 @@ class TelegramBotPoller {
 	private readonly config: TelegramConfig;
 	private readonly store: TelegramSharedStore;
 	private topicId: number | null | undefined;
-	private routing: { sessionId: string; sessionName?: string; cwd: string } | undefined;
+	private routing: { sessionId: string; sessionName?: string; getSessionName?: () => string | undefined; cwd: string } | undefined;
 	private localSession: { sessionId: string; instanceId: string; deliver: (text: string) => Promise<"idle" | "followUp"> } | undefined;
 	private registrationTimer: ReturnType<typeof setInterval> | undefined;
 	private abortController: AbortController | undefined;
@@ -1223,16 +1248,20 @@ class TelegramBotPoller {
 		this.store = createTelegramSharedStore(config);
 	}
 
-	setRouting(routing: { sessionId: string; sessionName?: string; cwd: string }): void { this.routing = routing; }
+	setRouting(routing: { sessionId: string; sessionName?: string; getSessionName?: () => string | undefined; cwd: string }): void { this.routing = routing; }
 
-	async activateSession(routing: { sessionId: string; sessionName?: string; cwd: string }, deliver: (text: string) => Promise<"idle" | "followUp">): Promise<void> {
+	async activateSession(routing: { sessionId: string; sessionName?: string; getSessionName?: () => string | undefined; cwd: string }, deliver: (text: string) => Promise<"idle" | "followUp">): Promise<void> {
 		this.setRouting(routing);
 		const instanceId = telegramLeaseToken();
 		const register = async () => {
 			await withTelegramTopicLock(this.store, async () => {
 				const path = registrationPath(this.store, routing.sessionId);
 				const existing = await readJsonFile<TelegramSessionRegistration>(path);
-				if (existing && Date.now() - existing.heartbeatAt <= TELEGRAM_LOCK_STALE_MS && existing.instanceId !== instanceId) return;
+				if (existing && Date.now() - existing.heartbeatAt <= TELEGRAM_LOCK_STALE_MS && existing.instanceId !== instanceId) {
+					// A fresh owner wins; an old runtime must stop consuming immediately.
+					if (this.localSession?.instanceId === instanceId) this.localSession = undefined;
+					return;
+				}
 				const map = await readJsonFile<TelegramTopicMap>(this.store.topicFile);
 				const binding = map && topicBinding(map, routing.sessionId);
 				await mkdir(this.store.registrationsDir, { recursive: true, mode: 0o700 });
@@ -1249,6 +1278,9 @@ class TelegramBotPoller {
 	async deactivateSession(): Promise<void> {
 		if (this.registrationTimer) clearInterval(this.registrationTimer);
 		this.registrationTimer = undefined;
+		// Release a held poll lease before deleting our registration so a reload can take over.
+		this.abortController?.abort();
+		await this.loopPromise;
 		const local = this.localSession; this.localSession = undefined;
 		if (!local) return;
 		await withTelegramTopicLock(this.store, async () => {
@@ -1260,16 +1292,30 @@ class TelegramBotPoller {
 
 	private async consumeInbox(): Promise<void> {
 		const local = this.localSession; if (!local) return;
-		const dir = join(this.store.inboxDir, local.instanceId);
+		const dir = dirname(inboxPath(this.store, local.sessionId, 0));
 		let entries: string[]; try { entries = await readdir(dir); } catch (error) { if (isErrno(error, "ENOENT")) return; throw error; }
+		const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1_000;
+		for (const entry of entries) {
+			if (!entry.endsWith(".done") && !entry.endsWith(".claimed")) continue;
+			try { if ((await stat(join(dir, entry))).mtimeMs < cutoff) await rm(join(dir, entry), { force: true }); } catch { /* best effort */ }
+		}
 		for (const entry of entries.filter((name) => name.endsWith(".json"))) {
 			const path = join(dir, entry); const claimed = `${path}.claimed`; const done = `${path}.done`;
 			try { await rename(path, claimed); } catch (error) { if (isErrno(error, "ENOENT")) continue; throw error; }
 			const envelope = await readJsonFile<TelegramInboxEnvelope>(claimed); if (!envelope) { await rm(claimed, { force: true }); continue; }
-			// Publishing completion before injection deliberately favors at-most-once delivery after a crash.
-			await rename(claimed, done);
-			try { const status = await local.deliver(envelope.text); await this.safeCallApi("setMessageReaction", { chat_id: this.config.chatId, message_id: envelope.messageId, reaction: [{ type: "emoji", emoji: status === "idle" ? "✅" : "⏳" }] }); }
-			catch { await this.safeCallApi("sendMessage", { chat_id: this.config.chatId, message_thread_id: envelope.threadId, reply_to_message_id: envelope.messageId, text: "Unable to deliver this message to Pi." }); }
+			await withTelegramTopicLock(this.store, async () => {
+				// Verify ownership after claiming and immediately before Pi injection.
+				const current = await readJsonFile<TelegramSessionRegistration>(registrationPath(this.store, local.sessionId));
+				if (this.localSession?.instanceId !== local.instanceId || !current || current.instanceId !== local.instanceId || Date.now() - current.heartbeatAt > TELEGRAM_LOCK_STALE_MS) {
+					this.localSession = undefined;
+					await rename(claimed, path).catch(() => undefined);
+					return;
+				}
+				// Completion before injection deliberately favors at-most-once delivery after a crash.
+				await rename(claimed, done);
+				try { const status = await local.deliver(envelope.text); await this.safeCallApi("setMessageReaction", { chat_id: this.config.chatId, message_id: envelope.messageId, reaction: [{ type: "emoji", emoji: status === "idle" ? "✅" : "⏳" }] }); }
+				catch { await this.safeCallApi("sendMessage", { chat_id: this.config.chatId, message_thread_id: envelope.threadId, reply_to_message_id: envelope.messageId, text: "Unable to deliver this message to Pi." }); }
+			});
 		}
 	}
 
@@ -1319,7 +1365,7 @@ class TelegramBotPoller {
 			if (!me.has_topics_enabled) return undefined;
 			const routing = this.routing;
 			if (!routing) return undefined;
-			const name = await resolveTelegramTopicName(routing.sessionId, routing.sessionName, routing.cwd);
+			const name = await resolveTelegramTopicName(routing.sessionId, routing.getSessionName?.() ?? routing.sessionName, routing.cwd);
 			if (!name) return undefined;
 			this.topicId = await withTelegramTopicLock(this.store, async () => {
 				const map = (await readJsonFile<TelegramTopicMap>(this.store.topicFile)) ?? { version: 2, topics: {}, threads: {} };
@@ -1452,6 +1498,7 @@ class TelegramBotPoller {
 	}
 
 	private async handleUpdate(update: TelegramUpdate): Promise<void> {
+		if (!(await claimTelegramUpdate(this.store, update.update_id))) return;
 		if (update.callback_query) {
 			await this.handleCallbackQuery(update.callback_query);
 		}
@@ -1555,7 +1602,7 @@ class TelegramBotPoller {
 			return;
 		}
 		await this.safeCallApi("setMessageReaction", { chat_id: this.config.chatId, message_id: message.message_id, reaction: [{ type: "emoji", emoji: "👀" }] });
-		await enqueueTelegramInbox(this.store, registration.instanceId, { updateId, text: message.text, messageId: message.message_id, threadId: message.message_thread_id, createdAt: Date.now() });
+		await enqueueTelegramInbox(this.store, registration.sessionId, { updateId, text: message.text, messageId: message.message_id, threadId: message.message_thread_id, createdAt: Date.now() });
 	}
 
 	private async answerSharedAsk(
@@ -1800,7 +1847,7 @@ class TelegramNotifyManager {
 		const config = await resolveTelegramConfig(); if (!config) return;
 		const sessionId = ctx.sessionManager.getSessionId(); if (!sessionId) return;
 		const poller = this.getPoller(config);
-		await poller.activateSession({ sessionId, sessionName: ctx.sessionManager.getSessionName(), cwd: ctx.cwd }, async (text) => {
+		await poller.activateSession({ sessionId, sessionName: ctx.sessionManager.getSessionName(), getSessionName: () => ctx.sessionManager.getSessionName(), cwd: ctx.cwd }, async (text) => {
 			const idle = ctx.isIdle();
 			await pi.sendUserMessage(text, idle ? undefined : { deliverAs: "followUp" });
 			return idle ? "idle" : "followUp";
