@@ -784,9 +784,13 @@ describe("ask_user", () => {
 		test("delivers busy Telegram free text as steer, never followUp", async () => {
 			const lease = await hooks();
 			const sent: Array<{ text: string; options?: { deliverAs?: "steer" | "followUp" } }> = [];
-			const status = await lease.deliverFreeText({ sendUserMessage: async (text: string, options?: { deliverAs?: "steer" | "followUp" }) => { sent.push({ text, options }); } } as any, "busy message", false);
-			expect(status).toBe("steer");
-			expect(sent).toEqual([{ text: "busy message", options: { deliverAs: "steer" } }]);
+			const pi = { sendUserMessage: async (text: string, options?: { deliverAs?: "steer" | "followUp" }) => { sent.push({ text, options }); } } as any;
+			expect(await lease.deliverFreeText(pi, "busy message", false)).toBe("steer");
+			expect(await lease.deliverFreeText(pi, "idle message", true)).toBe("idle");
+			expect(sent).toEqual([
+				{ text: "busy message", options: { deliverAs: "steer" } },
+				{ text: "idle message", options: undefined },
+			]);
 			expect(sent.some(({ options }) => options?.deliverAs === "followUp")).toBe(false);
 		});
 
