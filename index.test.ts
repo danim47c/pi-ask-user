@@ -8,7 +8,7 @@ import {
 	test,
 } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -824,6 +824,70 @@ describe("ask_user", () => {
 			emittedEvents.filter((event) => event.name === "herdr:blocked").at(-1)
 				?.payload,
 		).toMatchObject({ active: false, id: "ask-herdr-1" });
+	});
+
+	describe("Telegram lease ownership", () => {
+		async function hooks() {
+			return (await import("./index")).__telegramTestHooks;
+		}
+
+		function testLock(name: string): string {
+			const root = join(tmpdir(), "pi-telegram-lease-tests", name, String(process.pid));
+			rmSync(root, { recursive: true, force: true });
+			mkdirSync(root, { recursive: true });
+			return join(root, "lock");
+		}
+
+		test("a reclaimed owner cannot refresh or release its replacement", async () => {
+			const lease = await hooks();
+			const lockDir = testLock("stale-owner");
+			const old = await lease.tryAcquireLease(lockDir, -1);
+			expect(old).not.toBeNull();
+			expect(await lease.tryAcquireLease(lockDir, -1)).toBeNull(); // retire A
+			const replacement = await lease.tryAcquireLease(lockDir, -1);
+			expect(replacement).not.toBeNull();
+			const before = await lease.readLeaseOwner(lockDir);
+			await old!.refresh();
+			expect(await lease.readLeaseOwner(lockDir)).toEqual(before);
+			await old!.release();
+			expect(await lease.readLeaseOwner(lockDir)).toEqual(before);
+			await replacement!.release();
+		});
+
+		test("competing reclaimers and old cleanup retain the token fence", async () => {
+			const lease = await hooks();
+			const lockDir = testLock("reclaim-race");
+			const old = await lease.tryAcquireLease(lockDir, -1);
+			const owner = await lease.readLeaseOwner(lockDir);
+			expect(await Promise.all([lease.tryAcquireLease(lockDir, -1), lease.tryAcquireLease(lockDir, -1)])).toEqual([null, null]);
+			await lease.cleanupLeaseTombstones(lockDir, -1);
+			expect(existsSync(lease.tombstonePath(lockDir, owner.token))).toBe(true);
+			expect(existsSync(lease.leasePath(lockDir, owner.token))).toBe(false);
+			const replacement = await lease.tryAcquireLease(lockDir, -1);
+			const before = await lease.readLeaseOwner(lockDir);
+			await old!.release();
+			expect(await lease.readLeaseOwner(lockDir)).toEqual(before);
+			await replacement!.release();
+		});
+
+		test("publishes a complete owner before the lock becomes visible", async () => {
+			const lease = await hooks();
+			const lockDir = testLock("atomic-publication");
+			const lock = await lease.tryAcquireLease(lockDir, 10_000);
+			expect(await lease.readLeaseOwner(lockDir)).toMatchObject({ token: expect.any(String), heartbeatAt: expect.any(Number) });
+			await lock!.release();
+		});
+
+		test("keeps a newer topic ID and only retries explicit topic-not-found errors", async () => {
+			const lease = await hooks();
+			const topicFile = join(testLock("topic-invalidation"), "topics.json");
+			mkdirSync(join(topicFile, ".."), { recursive: true });
+			writeFileSync(topicFile, JSON.stringify({ topics: { project: 22 } }));
+			await lease.invalidateTopicMap(topicFile, "project", 11);
+			expect(readFileSync(topicFile, "utf8")).toBe(JSON.stringify({ topics: { project: 22 } }));
+			expect(lease.isInvalidTopicDescription("Bad Request: message thread was not found")).toBe(true);
+			expect(lease.isInvalidTopicDescription("Bad Request: request failed")).toBe(false);
+		});
 	});
 
 	describe("Telegram notifications", () => {

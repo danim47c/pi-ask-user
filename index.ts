@@ -42,11 +42,12 @@ import {
 	rename,
 	rm,
 	stat,
+	symlink,
 	writeFile,
 } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
@@ -256,6 +257,9 @@ const TELEGRAM_SEND_TIMEOUT_MS = 10_000;
 const TELEGRAM_RETRY_DELAY_MS = 3_000;
 const TELEGRAM_RESPONSE_POLL_MS = 50;
 const TELEGRAM_LOCK_STALE_MS = 70_000;
+// Keep token tombstone directories forever as ownership fences, while removing
+// their obsolete payloads after this long grace period.
+const TELEGRAM_LOCK_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1_000;
 const TELEGRAM_RECORD_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const TELEGRAM_MAX_MESSAGE_LENGTH = 3_900;
 const TELEGRAM_MAX_BUTTON_TEXT_LENGTH = 52;
@@ -1027,58 +1031,92 @@ function telegramLeaseToken(): string {
 	return `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-async function reclaimTelegramLease(lockDir: string, owner: TelegramLeaseOwner, staleMs: number): Promise<boolean> {
-	if (Date.now() - owner.heartbeatAt < staleMs) return false;
-	const tombstone = `${lockDir}.reclaim.${owner.token}`;
+function telegramLeasePath(lockDir: string, token: string): string {
+	return `${lockDir}.lease.${token}`;
+}
+
+function telegramLeaseTombstone(lockDir: string, token: string): string {
+	return `${lockDir}.tombstone.${token}`;
+}
+
+/**
+ * A tombstone directory is a permanent, token-specific compare-and-swap fence.
+ * Its payload may be collected, but the directory itself must remain: deleting
+ * it would let a delayed old owner reserve it again and move a newer pointer.
+ */
+async function retireTelegramLease(lockDir: string, owner: TelegramLeaseOwner, staleMs?: number): Promise<boolean> {
+	if (staleMs !== undefined && Date.now() - owner.heartbeatAt < staleMs) return false;
+	const tombstone = telegramLeaseTombstone(lockDir, owner.token);
 	try { await mkdir(tombstone, { mode: 0o700 }); } catch (error) {
 		if (isErrno(error, "EEXIST")) return false;
 		throw error;
 	}
 	try {
 		const current = await readJsonFile<TelegramLeaseOwner>(join(lockDir, "owner.json"));
-		if (current?.token !== owner.token || Date.now() - current.heartbeatAt < staleMs) return false;
-		// The token-specific tombstone blocks all compliant acquirers before this move.
-		await rename(lockDir, join(tombstone, "lock"));
+		if (current?.token !== owner.token || (staleMs !== undefined && Date.now() - current.heartbeatAt < staleMs)) return false;
+		// We exclusively own this token's destination.  No other compliant actor
+		// can remove this pointer before us, so rename cannot target a replacement.
+		await rename(lockDir, join(tombstone, "pointer"));
 		return true;
 	} catch (error) {
 		if (isErrno(error, "ENOENT")) return false;
 		throw error;
-	} finally {
-		await rm(tombstone, { recursive: true, force: true });
 	}
 }
 
+async function cleanupTelegramLeaseTombstones(lockDir: string, ttlMs = TELEGRAM_LOCK_TOMBSTONE_TTL_MS): Promise<void> {
+	const parent = dirname(lockDir);
+	const prefix = `${basename(lockDir)}.tombstone.`;
+	let entries: string[];
+	try { entries = await readdir(parent); } catch (error) { if (isErrno(error, "ENOENT")) return; throw error; }
+	await Promise.all(entries.filter((entry) => entry.startsWith(prefix)).map(async (entry) => {
+		const tombstone = join(parent, entry);
+		try {
+			if (Date.now() - (await stat(tombstone)).mtimeMs >= ttlMs) {
+				const token = entry.slice(prefix.length);
+				await rm(join(tombstone, "pointer"), { force: true });
+				await rm(telegramLeasePath(lockDir, token), { recursive: true, force: true });
+			}
+		} catch (error) { if (!isErrno(error, "ENOENT")) throw error; }
+		return undefined;
+	}));
+}
+
+async function reclaimTelegramLease(lockDir: string, owner: TelegramLeaseOwner, staleMs: number): Promise<boolean> {
+	return await retireTelegramLease(lockDir, owner, staleMs);
+}
+
 async function tryAcquireTelegramLease(lockDir: string, staleMs: number): Promise<TelegramPollLock | null> {
+	await cleanupTelegramLeaseTombstones(lockDir);
 	const token = telegramLeaseToken();
-	const candidate = `${lockDir}.candidate.${token}`;
-	const ownerFile = join(lockDir, "owner.json");
-	await mkdir(candidate, { mode: 0o700 });
-	await writeJsonFileAtomic(join(candidate, "owner.json"), { token, pid: process.pid, heartbeatAt: Date.now() });
+	const leaseDir = telegramLeasePath(lockDir, token);
+	const leaseOwnerFile = join(leaseDir, "owner.json");
+	await mkdir(leaseDir, { mode: 0o700 });
+	await writeJsonFileAtomic(leaseOwnerFile, { token, pid: process.pid, heartbeatAt: Date.now() });
 	try {
-		const entries = await readdir(join(lockDir, ".."));
-		if (entries.some((entry) => entry.startsWith(`${lockDir.split("/").pop()}.reclaim.`))) {
-			await rm(candidate, { recursive: true, force: true });
-			return null;
-		}
-		await rename(candidate, lockDir); // initialized candidate publication is atomic
+		// A symlink is the sole mutable ownership pointer.  It is published only
+		// after its target has a complete owner record, so readers never see an
+		// initialized-but-ownerless stale window.
+		await symlink(leaseDir, lockDir, process.platform === "win32" ? "junction" : "dir");
 	} catch (error) {
-		await rm(candidate, { recursive: true, force: true });
-		if (!isErrno(error, "EEXIST") && !isErrno(error, "ENOTEMPTY")) throw error;
-		const owner = await readJsonFile<TelegramLeaseOwner>(ownerFile);
+		await rm(leaseDir, { recursive: true, force: true });
+		if (!isErrno(error, "EEXIST")) throw error;
+		const owner = await readJsonFile<TelegramLeaseOwner>(join(lockDir, "owner.json"));
 		if (owner) await reclaimTelegramLease(lockDir, owner, staleMs);
 		return null;
 	}
 	let released = false;
-	const ownsLease = async () => (await readJsonFile<TelegramLeaseOwner>(ownerFile))?.token === token;
 	return {
 		refresh: async () => {
-			if (released || !(await ownsLease())) return;
-			await writeJsonFileAtomic(ownerFile, { token, pid: process.pid, heartbeatAt: Date.now() });
+			if (released) return;
+			// Never write through lockDir: a reclaimed owner can only touch its
+			// immutable per-token lease object, not a replacement owner's record.
+			await writeJsonFileAtomic(leaseOwnerFile, { token, pid: process.pid, heartbeatAt: Date.now() });
 		},
 		release: async () => {
 			if (released) return;
 			released = true;
-			if (await ownsLease()) await rm(lockDir, { recursive: true, force: true });
+			await retireTelegramLease(lockDir, { token, pid: process.pid, heartbeatAt: Date.now() });
 		},
 	};
 }
@@ -1117,6 +1155,14 @@ function isRichMessageUnsupported(error: unknown): boolean {
 
 function isInvalidTopic(error: unknown): boolean {
 	return error instanceof TelegramApiError && /(?:message[ _-]?thread|topic|thread)\s+(?:was\s+)?(?:not found|invalid|deleted|closed)|(?:not found|invalid|deleted|closed)\s+(?:message[ _-]?thread|topic|thread)/i.test(error.description);
+}
+
+async function invalidateTelegramTopicMap(topicFile: string, key: string, rejectedThreadId: number): Promise<void> {
+	const map = await readJsonFile<TelegramTopicMap>(topicFile);
+	// Do not erase a replacement created by another process.
+	if (!map || map.topics[key] !== rejectedThreadId) return;
+	delete map.topics[key];
+	await writeJsonFileAtomic(topicFile, map);
 }
 
 class TelegramBotPoller {
@@ -1198,11 +1244,7 @@ class TelegramBotPoller {
 		if (!name) return;
 		const key = createHash("sha256").update(name).digest("hex");
 		await withTelegramTopicLock(this.store, async () => {
-			const map = await readJsonFile<TelegramTopicMap>(this.store.topicFile);
-			// Do not erase a replacement created by another process.
-			if (!map || map.topics[key] !== rejectedThreadId) return;
-			delete map.topics[key];
-			await writeJsonFileAtomic(this.store.topicFile, map);
+			await invalidateTelegramTopicMap(this.store.topicFile, key, rejectedThreadId);
 		});
 	}
 
@@ -3476,6 +3518,17 @@ async function askViaDialogs(
 	)) as string | undefined;
 	return createSelectionResponse([selected], comment);
 }
+
+/** Internal test seam; not used by the extension runtime. */
+export const __telegramTestHooks = {
+	tryAcquireLease: tryAcquireTelegramLease,
+	cleanupLeaseTombstones: cleanupTelegramLeaseTombstones,
+	readLeaseOwner: async (lockDir: string) => await readJsonFile<TelegramLeaseOwner>(join(lockDir, "owner.json")),
+	leasePath: telegramLeasePath,
+	tombstonePath: telegramLeaseTombstone,
+	invalidateTopicMap: invalidateTelegramTopicMap,
+	isInvalidTopicDescription: (description: string) => isInvalidTopic(new TelegramApiError(400, description)),
+};
 
 export default function (pi: ExtensionAPI) {
 	const activeAsyncRunIds = new Set<string>();
