@@ -285,13 +285,13 @@ function stubTelegramSettings(
 }
 
 function stubAskAvailabilitySettings(
-	normalTimeoutMs: number,
 	awayTimeoutMs: number,
+	ignoredNormalTimeoutMs?: number,
 ): void {
 	const homeDir = join(
 		tmpdir(),
 		"pi-telegram-notify-availability-test-home",
-		`${process.pid}-${normalTimeoutMs}-${awayTimeoutMs}`,
+		`${process.pid}-${awayTimeoutMs}-${ignoredNormalTimeoutMs ?? "none"}`,
 	);
 	rmSync(homeDir, { recursive: true, force: true });
 	const agentDir = join(homeDir, ".pi", "agent");
@@ -300,7 +300,7 @@ function stubAskAvailabilitySettings(
 		join(agentDir, "settings.json"),
 		`${JSON.stringify({
 			askUser: {
-				availability: { normalTimeoutMs, awayTimeoutMs },
+				availability: { awayTimeoutMs, ...(ignoredNormalTimeoutMs ? { normalTimeoutMs: ignoredNormalTimeoutMs } : {}) },
 			},
 		})}\n`,
 	);
@@ -556,113 +556,63 @@ describe("ask_user", () => {
 		expect(result.content[0].text).toContain("pause_goal");
 	});
 
-	test("switches to the shorter away timeout after the first timeout", async () => {
-		stubAskAvailabilitySettings(20, 7);
-		const tool = await setupTool();
-		const ctx = {
+	test("normal mode has no implicit timeout and explicit timeouts do not enter away", async () => {
+		stubAskAvailabilitySettings(7, 5);
+		const extension = await setupExtension();
+		const resolvingCtx = {
 			hasUI: true,
 			ui: {
-				custom: async (factory: any) => {
-					return await new Promise((resolve) => {
-						factory(
-							{ requestRender() {}, terminal: { rows: 24 } },
-							createTheme(),
-							createKeybindings(),
-							resolve,
-						);
-					});
-				},
+				custom: async (factory: any) => await new Promise((resolve) => {
+					factory({ requestRender() {}, terminal: { rows: 24 } }, createTheme(), createKeybindings(), resolve);
+					setTimeout(() => resolve({ kind: "selection", selections: ["A"] }), 15);
+				}),
 			},
 		};
+		const normal = await extension.tool.execute("normal", { question: "Normal?", options: ["A"] }, undefined, undefined, resolvingCtx);
+		expect(normal.details.timedOut).toBeUndefined();
+		expect(normal.details.response).toEqual({ kind: "selection", selections: ["A"] });
 
-		const first = await tool.execute(
-			"availability-first",
-			{ question: "First?", options: ["A"] },
-			undefined,
-			undefined,
-			ctx,
-		);
-		const second = await tool.execute(
-			"availability-second",
-			{ question: "Second?", options: ["A"] },
-			undefined,
-			undefined,
-			ctx,
-		);
-
-		expect(first.details.timedOut).toBe(true);
-		expect(second.details.timedOut).toBe(true);
-		expect(first.details.timeoutMs).toBe(20);
-		expect(second.details.timeoutMs).toBe(7);
+		const timeoutCtx = { hasUI: true, ui: { custom: async (factory: any) => await new Promise((resolve) => {
+			factory({ requestRender() {}, terminal: { rows: 24 } }, createTheme(), createKeybindings(), resolve);
+		}) } };
+		const timedOut = await extension.tool.execute("explicit", { question: "Explicit?", options: ["A"], timeout: 5 }, undefined, undefined, timeoutCtx);
+		expect(timedOut.details.timedOut).toBe(true);
+		expect(timedOut.details.timeoutMs).toBe(5);
+		const notifications: string[] = [];
+		await extension.commands.get("ask-status")?.handler("", { ui: { notify: (message: string) => notifications.push(message) } });
+		expect(notifications.at(-1)).toContain("availability: normal");
 	});
 
-	test("only human input resets away mode; goal continuation input does not", async () => {
-		stubAskAvailabilitySettings(18, 6);
+	test("manual away caps timeouts and reset restores no implicit timeout", async () => {
+		stubAskAvailabilitySettings(7);
 		const extension = await setupExtension();
-		const ctx = {
+		const pendingCtx = { hasUI: true, ui: { custom: async (factory: any) => await new Promise((resolve) => {
+			factory({ requestRender() {}, terminal: { rows: 24 } }, createTheme(), createKeybindings(), resolve);
+		}) } };
+		await extension.commands.get("ask-away")?.handler("", { ui: { notify() {} } });
+		const away = await extension.tool.execute("away", { question: "Away?", options: ["A"], timeout: 50 }, undefined, undefined, pendingCtx);
+		expect(away.details.timeoutMs).toBe(7);
+		await extension.commands.get("ask-reset")?.handler("", { ui: { notify() {} } });
+		const reset = await extension.tool.execute("reset", { question: "Reset?", options: ["A"] }, undefined, undefined, {
 			hasUI: true,
-			ui: {
-				custom: async (factory: any) =>
-					await new Promise((resolve) => {
-						factory(
-							{ requestRender() {}, terminal: { rows: 24 } },
-							createTheme(),
-							createKeybindings(),
-							resolve,
-						);
-					}),
-			},
-		};
-
-		await extension.tool.execute(
-			"presence-first",
-			{ question: "First?", options: ["A"] },
-			undefined,
-			undefined,
-			ctx,
-		);
-		await runExtensionHandlers(extension, "input", {
-			source: "extension",
-			text: "<pi_goal_continuation />",
+			ui: { custom: async (factory: any) => await new Promise((resolve) => {
+				factory({ requestRender() {}, terminal: { rows: 24 } }, createTheme(), createKeybindings(), resolve);
+				setTimeout(() => resolve({ kind: "selection", selections: ["A"] }), 15);
+			}) },
 		});
-		const afterGoalContinuation = await extension.tool.execute(
-			"presence-extension",
-			{ question: "Still away?", options: ["A"] },
-			undefined,
-			undefined,
-			ctx,
-		);
-		expect(afterGoalContinuation.details.timeoutMs).toBe(6);
-
-		await runExtensionHandlers(extension, "input", {
-			source: "interactive",
-			text: "I'm back",
-		});
-		const afterHumanInput = await extension.tool.execute(
-			"presence-human",
-			{ question: "Normal again?", options: ["A"] },
-			undefined,
-			undefined,
-			ctx,
-		);
-		expect(afterHumanInput.details.timeoutMs).toBe(18);
+		expect(reset.details.timedOut).toBeUndefined();
 	});
 
 	test("registers status, away, and reset availability commands", async () => {
-		stubAskAvailabilitySettings(600_000, 60_000);
+		stubAskAvailabilitySettings(60_000);
 		const extension = await setupExtension();
 		const notifications: string[] = [];
-		const ctx = {
-			ui: {
-				notify(message: string) {
-					notifications.push(message);
-				},
-			},
-		};
-
+		const ctx = { ui: { notify(message: string) { notifications.push(message); } } };
 		await extension.commands.get("ask-away")?.handler("", ctx);
 		await extension.commands.get("ask-status")?.handler("", ctx);
 		expect(notifications.at(-1)).toContain("availability: away");
+		expect(notifications.at(-1)).toContain("Normal timeout: none (explicit per-call only)");
+		expect(notifications.at(-1)).toContain("Away timeout: 1 min");
 		await extension.commands.get("ask-reset")?.handler("", ctx);
 		await extension.commands.get("ask-status")?.handler("", ctx);
 		expect(notifications.at(-1)).toContain("availability: normal");
@@ -830,6 +780,15 @@ describe("ask_user", () => {
 		async function hooks() {
 			return (await import("./index")).__telegramTestHooks;
 		}
+
+		test("delivers busy Telegram free text as steer, never followUp", async () => {
+			const lease = await hooks();
+			const sent: Array<{ text: string; options?: { deliverAs?: "steer" | "followUp" } }> = [];
+			const status = await lease.deliverFreeText({ sendUserMessage: async (text: string, options?: { deliverAs?: "steer" | "followUp" }) => { sent.push({ text, options }); } } as any, "busy message", false);
+			expect(status).toBe("steer");
+			expect(sent).toEqual([{ text: "busy message", options: { deliverAs: "steer" } }]);
+			expect(sent.some(({ options }) => options?.deliverAs === "followUp")).toBe(false);
+		});
 
 		function testLock(name: string): string {
 			const root = join(tmpdir(), "pi-telegram-lease-tests", name, String(process.pid));
@@ -1069,7 +1028,7 @@ describe("ask_user", () => {
 			const poller = lease.createPoller(config);
 			poller.setRouting({ sessionId: "inbound-session", cwd: process.cwd() });
 			await poller.sendNotificationMessage("create topic");
-			await poller.activateSession({ sessionId: "inbound-session", cwd: process.cwd() }, async (text: string) => { delivered.push(text); return delivered.length === 1 ? "idle" : "followUp"; });
+			await poller.activateSession({ sessionId: "inbound-session", cwd: process.cwd() }, async (text: string) => { delivered.push(text); return delivered.length === 1 ? "idle" : "steer"; });
 			await lease.handleUpdate(poller, { update_id: 501, message: { message_id: 91, message_thread_id: 31, chat: { id: 4242 }, text: "first" } });
 			await lease.consumeInbox(poller);
 			await lease.handleUpdate(poller, { update_id: 502, message: { message_id: 92, message_thread_id: 31, chat: { id: 4242 }, text: "second" } });

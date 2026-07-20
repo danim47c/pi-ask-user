@@ -126,41 +126,31 @@ Pass `"off"`, `"none"`, or `"disabled"` (at any level) to disable the shortcut e
 
 ### Availability timeouts
 
-By default, `ask_user` waits up to 10 minutes. The first timeout marks the user
-as away globally; subsequent questions from any Pi session wait one minute.
-Interactive/RPC input, local answers, Telegram answers, and manual cancellation
-reset availability to normal. Extension-generated input, including automatic
-goal continuations, does not reset it.
+In normal mode, `ask_user` has no implicit timeout; only a positive per-call
+`timeout` applies. A timeout does not change availability. On timeout, the tool
+returns guidance to continue safely or pause an active goal.
 
-Configure the policy in `~/.pi/agent/settings.json`:
+Use `/ask-away` to manually enter away mode. While away, the configured
+one-minute default timeout is an upper bound on any explicit per-call timeout.
+Use `/ask-reset` to return to normal mode. Existing human activity also resets
+away mode to normal. Check the current mode with `/ask-status`.
+
+Configure the away limit in `~/.pi/agent/settings.json`:
 
 ```json
 {
   "askUser": {
     "availability": {
       "enabled": true,
-      "normalTimeoutMs": 600000,
       "awayTimeoutMs": 60000
     }
   }
 }
 ```
 
-An explicit per-call `timeout` can shorten, but never extend, the configured
-limit. Set `enabled` to `false` to restore the old behavior where only explicit
-per-call timeouts apply. Availability is shared through
+Set `enabled` to `false` to disable the availability policy entirely; explicit
+per-call timeouts continue to work. Availability is shared through
 `~/.pi/agent/ask-user-presence.json` with atomic cross-session updates.
-
-Commands:
-
-- `/ask-status` — show the current mode and configured limits.
-- `/ask-away` — manually use the shorter away timeout.
-- `/ask-reset` — return to normal mode.
-
-On timeout, the tool tells the agent not to repeat the question immediately: it
-must choose a safe/recommended option and state the assumption, or call
-`pause_goal` when an active goal cannot proceed safely without the user. This
-prevents goal auto-continuation from remaining blocked forever.
 
 ### Telegram notifications
 

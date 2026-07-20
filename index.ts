@@ -163,7 +163,6 @@ interface TelegramNotifySettingsFile {
 	askUser?: {
 		availability?: {
 			enabled?: boolean;
-			normalTimeoutMs?: number;
 			awayTimeoutMs?: number;
 		};
 	};
@@ -181,7 +180,6 @@ interface TelegramNotifySettingsFile {
 
 interface AskAvailabilityConfig {
 	enabled: boolean;
-	normalTimeoutMs: number;
 	awayTimeoutMs: number;
 }
 
@@ -273,7 +271,6 @@ const TELEGRAM_LOCK_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1_000;
 const TELEGRAM_RECORD_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const TELEGRAM_MAX_MESSAGE_LENGTH = 3_900;
 const TELEGRAM_MAX_BUTTON_TEXT_LENGTH = 52;
-const ASK_AVAILABILITY_DEFAULT_NORMAL_TIMEOUT_MS = 10 * 60_000;
 const ASK_AVAILABILITY_DEFAULT_AWAY_TIMEOUT_MS = 60_000;
 const ASK_PRESENCE_LOCK_STALE_MS = 5_000;
 const ASK_PRESENCE_LOCK_WAIT_MS = 2_000;
@@ -317,10 +314,6 @@ async function resolveAskAvailabilityConfig(): Promise<AskAvailabilityConfig> {
 	const availability = settings?.askUser?.availability;
 	return {
 		enabled: availability?.enabled !== false,
-		normalTimeoutMs: validTimeoutMs(
-			availability?.normalTimeoutMs,
-			ASK_AVAILABILITY_DEFAULT_NORMAL_TIMEOUT_MS,
-		),
 		awayTimeoutMs: validTimeoutMs(
 			availability?.awayTimeoutMs,
 			ASK_AVAILABILITY_DEFAULT_AWAY_TIMEOUT_MS,
@@ -392,20 +385,6 @@ async function recordHumanActivity(): Promise<void> {
 			mode: "normal",
 			updatedAt: now,
 			lastHumanActivityAt: now,
-		});
-	});
-}
-
-async function markUserAway(questionStartedAt: number): Promise<void> {
-	await withAskPresenceLock(async () => {
-		const current = await readAskPresenceState();
-		if ((current.lastHumanActivityAt ?? 0) > questionStartedAt) return;
-		const now = Date.now();
-		await writeAskPresenceState({
-			...current,
-			mode: "away",
-			updatedAt: now,
-			awaySince: current.awaySince ?? now,
 		});
 	});
 }
@@ -1266,7 +1245,7 @@ class TelegramBotPoller {
 	private readonly store: TelegramSharedStore;
 	private topicId: number | null | undefined;
 	private routing: { sessionId: string; sessionName?: string; getSessionName?: () => string | undefined; cwd: string } | undefined;
-	private localSession: { sessionId: string; instanceId: string; deliver: (text: string) => Promise<"idle" | "followUp"> } | undefined;
+	private localSession: { sessionId: string; instanceId: string; deliver: (text: string) => Promise<"idle" | "steer"> } | undefined;
 	private registrationTimer: ReturnType<typeof setInterval> | undefined;
 	private abortController: AbortController | undefined;
 	private loopPromise: Promise<void> | undefined;
@@ -1283,7 +1262,7 @@ class TelegramBotPoller {
 
 	setRouting(routing: { sessionId: string; sessionName?: string; getSessionName?: () => string | undefined; cwd: string }): void { this.routing = routing; }
 
-	async activateSession(routing: { sessionId: string; sessionName?: string; getSessionName?: () => string | undefined; cwd: string }, deliver: (text: string) => Promise<"idle" | "followUp">): Promise<void> {
+	async activateSession(routing: { sessionId: string; sessionName?: string; getSessionName?: () => string | undefined; cwd: string }, deliver: (text: string) => Promise<"idle" | "steer">): Promise<void> {
 		// A second session_start first retires the old local generation and timer.
 		await this.deactivateSession();
 		this.setRouting(routing);
@@ -1357,7 +1336,7 @@ class TelegramBotPoller {
 			await withTelegramTopicLock(this.store, async () => {
 				const current = await readJsonFile<TelegramSessionRegistration>(registrationPath(this.store, local.sessionId));
 				if (generation !== this.activeGeneration || this.localSession?.instanceId !== local.instanceId || !current || current.instanceId !== local.instanceId || Date.now() - current.heartbeatAt > TELEGRAM_LOCK_STALE_MS) return;
-				let status: "idle" | "followUp";
+				let status: "idle" | "steer";
 				try { status = await local.deliver(envelope.text); }
 				catch {
 					await this.safeCallApi("sendMessage", { chat_id: this.config.chatId, message_thread_id: envelope.threadId, reply_to_message_id: envelope.messageId, text: "Unable to deliver this message to Pi." });
@@ -1902,6 +1881,11 @@ interface TelegramSentNotificationHandle {
 	edit: (text: string) => Promise<void>;
 }
 
+async function deliverTelegramFreeText(pi: ExtensionAPI, text: string, idle: boolean): Promise<"idle" | "steer"> {
+	await pi.sendUserMessage(text, idle ? undefined : { deliverAs: "steer" });
+	return idle ? "idle" : "steer";
+}
+
 class TelegramNotifyManager {
 	private pollers = new Map<string, TelegramBotPoller>();
 
@@ -1911,9 +1895,7 @@ class TelegramNotifyManager {
 		const sessionId = ctx.sessionManager.getSessionId(); if (!sessionId) return;
 		const poller = this.getPoller(config);
 		await poller.activateSession({ sessionId, sessionName: ctx.sessionManager.getSessionName(), getSessionName: () => ctx.sessionManager.getSessionName(), cwd: ctx.cwd }, async (text) => {
-			const idle = ctx.isIdle();
-			await pi.sendUserMessage(text, idle ? undefined : { deliverAs: "followUp" });
-			return idle ? "idle" : "followUp";
+			return await deliverTelegramFreeText(pi, text, ctx.isIdle());
 		});
 	}
 
@@ -3777,6 +3759,7 @@ export const __telegramTestHooks = {
 	resolveTopicName: resolveTelegramTopicName,
 	handleUpdate: async (poller: TelegramBotPoller, update: TelegramUpdate) => await (poller as unknown as { handleUpdate: (value: TelegramUpdate) => Promise<void> }).handleUpdate(update),
 	consumeInbox: async (poller: TelegramBotPoller) => await (poller as unknown as { consumeInbox: () => Promise<void> }).consumeInbox(),
+	deliverFreeText: deliverTelegramFreeText,
 	cleanupInboxDone: cleanupTelegramInboxDone,
 };
 
@@ -3861,7 +3844,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(
 				[
 					`ask_user availability: ${config.enabled ? presence.mode : "disabled"}`,
-					`Normal timeout: ${formatDurationMs(config.normalTimeoutMs)}`,
+					"Normal timeout: none (explicit per-call only)",
 					`Away timeout: ${formatDurationMs(config.awayTimeoutMs)}`,
 					presence.awaySince
 						? `Away since: ${new Date(presence.awaySince).toLocaleString()}`
@@ -3965,7 +3948,7 @@ export default function (pi: ExtensionAPI) {
 			timeout: Type.Optional(
 				Type.Number({
 					description:
-						"Optional per-call timeout in milliseconds. The configured availability timeout is always an upper bound. On expiry, the tool returns guidance to continue safely or pause an active goal.",
+						"Optional per-call timeout in milliseconds. In away mode, the configured away timeout is an upper bound. On expiry, the tool returns guidance to continue safely or pause an active goal.",
 				}),
 			),
 		}),
@@ -3998,7 +3981,6 @@ export default function (pi: ExtensionAPI) {
 			const questionStartedAt = Date.now();
 			const availability = await resolveAskAvailabilityConfig().catch(() => ({
 				enabled: true,
-				normalTimeoutMs: ASK_AVAILABILITY_DEFAULT_NORMAL_TIMEOUT_MS,
 				awayTimeoutMs: ASK_AVAILABILITY_DEFAULT_AWAY_TIMEOUT_MS,
 			}));
 			const presence = availability.enabled
@@ -4007,14 +3989,10 @@ export default function (pi: ExtensionAPI) {
 						updatedAt: questionStartedAt,
 					}))
 				: { mode: "normal" as const, updatedAt: questionStartedAt };
-			const policyTimeout =
-				presence.mode === "away"
-					? availability.awayTimeoutMs
-					: availability.normalTimeoutMs;
-			const timeout = availability.enabled
+			const timeout = availability.enabled && presence.mode === "away"
 				? requestedTimeout && requestedTimeout > 0
-					? Math.min(requestedTimeout, policyTimeout)
-					: policyTimeout
+					? Math.min(requestedTimeout, availability.awayTimeoutMs)
+					: availability.awayTimeoutMs
 				: requestedTimeout;
 			let timeoutReached = false;
 			const timeoutMarker =
@@ -4066,7 +4044,6 @@ export default function (pi: ExtensionAPI) {
 			};
 			const cancelledResult = async (manualActivity: boolean) => {
 				if (didTimeOut()) {
-					await markUserAway(questionStartedAt).catch(() => undefined);
 					pi.events.emit("ask:timed_out", {
 						question,
 						context: normalizedContext,
