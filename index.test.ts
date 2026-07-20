@@ -213,10 +213,19 @@ type RegisteredTool = {
 type RegisteredExtension = {
 	tool: RegisteredTool;
 	handlers: Map<string, Array<(event?: any, ctx?: any) => Promise<any>>>;
+	eventHandlers: Map<string, Array<(event?: any) => any>>;
+	commands: Map<string, { handler: (args: string, ctx: any) => Promise<void> }>;
 };
 
 beforeEach(() => {
 	process.env.HOME = DEFAULT_TEST_HOME;
+	rmSync(join(DEFAULT_TEST_HOME, ".pi", "agent", "ask-user-presence.json"), {
+		force: true,
+	});
+	rmSync(join(DEFAULT_TEST_HOME, ".pi", "agent", "ask-user-presence.lock"), {
+		recursive: true,
+		force: true,
+	});
 	blockUnexpectedNetworkCalls();
 });
 
@@ -243,7 +252,11 @@ function cleanupTelegramStore(botToken: string, chatId: string): void {
 	});
 }
 
-function stubTelegramSettings(botToken: string, chatId: string): void {
+function stubTelegramSettings(
+	botToken: string,
+	chatId: string,
+	namespaced = false,
+): void {
 	cleanupTelegramStore(botToken, chatId);
 	const homeDir = join(
 		tmpdir(),
@@ -258,18 +271,41 @@ function stubTelegramSettings(botToken: string, chatId: string): void {
 	mkdirSync(agentDir, { recursive: true });
 	writeFileSync(
 		join(agentDir, "settings.json"),
-		`${JSON.stringify({
-			telegram: {
-				botToken,
-				chatId,
-			},
-		})}\n`,
+		`${JSON.stringify(
+			namespaced
+				? { piAskUser: { telegram: { botToken, chatId } } }
+				: { telegram: { botToken, chatId } },
+		)}\n`,
 	);
 	stubEnv("HOME", homeDir);
 	stubEnv("PI_TELEGRAM_NOTIFY_DELAY_MS", "0");
 	onTestFinished(() => {
 		rmSync(homeDir, { recursive: true, force: true });
 	});
+}
+
+function stubAskAvailabilitySettings(
+	normalTimeoutMs: number,
+	awayTimeoutMs: number,
+): void {
+	const homeDir = join(
+		tmpdir(),
+		"pi-telegram-notify-availability-test-home",
+		`${process.pid}-${normalTimeoutMs}-${awayTimeoutMs}`,
+	);
+	rmSync(homeDir, { recursive: true, force: true });
+	const agentDir = join(homeDir, ".pi", "agent");
+	mkdirSync(agentDir, { recursive: true });
+	writeFileSync(
+		join(agentDir, "settings.json"),
+		`${JSON.stringify({
+			askUser: {
+				availability: { normalTimeoutMs, awayTimeoutMs },
+			},
+		})}\n`,
+	);
+	stubEnv("HOME", homeDir);
+	onTestFinished(() => rmSync(homeDir, { recursive: true, force: true }));
 }
 
 function stubFetch(
@@ -292,7 +328,11 @@ function telegramOk(result: unknown): Response {
 }
 
 function jsonBody(init?: RequestInit): any {
-	return JSON.parse(String(init?.body ?? "{}"));
+	try {
+		return JSON.parse(String(init?.body ?? "{}"));
+	} catch {
+		return {};
+	}
 }
 
 async function waitUntil(predicate: () => boolean): Promise<void> {
@@ -310,10 +350,18 @@ async function setupExtension(moduleSuffix = ""): Promise<RegisteredExtension> {
 		string,
 		Array<(event?: any, ctx?: any) => Promise<any>>
 	>();
+	const eventHandlers = new Map<string, Array<(event?: any) => any>>();
+	const commands = new Map<
+		string,
+		{ handler: (args: string, ctx: any) => Promise<void> }
+	>();
 	emittedEvents = [];
 	const pi = {
 		registerTool(tool: RegisteredTool) {
 			registeredTool = tool;
+		},
+		registerCommand(name: string, command: any) {
+			commands.set(name, command);
 		},
 		on(eventName: string, handler: (event?: any, ctx?: any) => Promise<any>) {
 			const existing = handlers.get(eventName) ?? [];
@@ -323,6 +371,19 @@ async function setupExtension(moduleSuffix = ""): Promise<RegisteredExtension> {
 		events: {
 			emit(name: string, payload: any) {
 				emittedEvents.push({ name, payload });
+				for (const handler of eventHandlers.get(name) ?? []) handler(payload);
+			},
+			on(name: string, handler: (payload?: any) => any) {
+				const existing = eventHandlers.get(name) ?? [];
+				existing.push(handler);
+				eventHandlers.set(name, existing);
+				return () => {
+					const current = eventHandlers.get(name) ?? [];
+					eventHandlers.set(
+						name,
+						current.filter((candidate) => candidate !== handler),
+					);
+				};
 			},
 		},
 	} as any;
@@ -333,7 +394,7 @@ async function setupExtension(moduleSuffix = ""): Promise<RegisteredExtension> {
 		throw new Error("Tool was not registered");
 	}
 
-	return { tool: registeredTool, handlers };
+	return { tool: registeredTool, handlers, eventHandlers, commands };
 }
 
 async function setupTool(moduleSuffix = ""): Promise<RegisteredTool> {
@@ -348,6 +409,16 @@ async function runExtensionHandlers(
 ): Promise<void> {
 	for (const handler of extension.handlers.get(eventName) ?? []) {
 		await handler(event, ctx);
+	}
+}
+
+function emitExtensionEvent(
+	extension: RegisteredExtension,
+	eventName: string,
+	payload?: any,
+): void {
+	for (const handler of extension.eventHandlers.get(eventName) ?? []) {
+		handler(payload);
 	}
 }
 
@@ -481,6 +552,120 @@ describe("ask_user", () => {
 
 		expect(result.details.cancelled).toBe(true);
 		expect(result.details.response).toBeNull();
+		expect(result.details.timedOut).toBe(true);
+		expect(result.content[0].text).toContain("pause_goal");
+	});
+
+	test("switches to the shorter away timeout after the first timeout", async () => {
+		stubAskAvailabilitySettings(20, 7);
+		const tool = await setupTool();
+		const ctx = {
+			hasUI: true,
+			ui: {
+				custom: async (factory: any) => {
+					return await new Promise((resolve) => {
+						factory(
+							{ requestRender() {}, terminal: { rows: 24 } },
+							createTheme(),
+							createKeybindings(),
+							resolve,
+						);
+					});
+				},
+			},
+		};
+
+		const first = await tool.execute(
+			"availability-first",
+			{ question: "First?", options: ["A"] },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const second = await tool.execute(
+			"availability-second",
+			{ question: "Second?", options: ["A"] },
+			undefined,
+			undefined,
+			ctx,
+		);
+
+		expect(first.details.timedOut).toBe(true);
+		expect(second.details.timedOut).toBe(true);
+		expect(first.details.timeoutMs).toBe(20);
+		expect(second.details.timeoutMs).toBe(7);
+	});
+
+	test("only human input resets away mode; goal continuation input does not", async () => {
+		stubAskAvailabilitySettings(18, 6);
+		const extension = await setupExtension();
+		const ctx = {
+			hasUI: true,
+			ui: {
+				custom: async (factory: any) =>
+					await new Promise((resolve) => {
+						factory(
+							{ requestRender() {}, terminal: { rows: 24 } },
+							createTheme(),
+							createKeybindings(),
+							resolve,
+						);
+					}),
+			},
+		};
+
+		await extension.tool.execute(
+			"presence-first",
+			{ question: "First?", options: ["A"] },
+			undefined,
+			undefined,
+			ctx,
+		);
+		await runExtensionHandlers(extension, "input", {
+			source: "extension",
+			text: "<pi_goal_continuation />",
+		});
+		const afterGoalContinuation = await extension.tool.execute(
+			"presence-extension",
+			{ question: "Still away?", options: ["A"] },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect(afterGoalContinuation.details.timeoutMs).toBe(6);
+
+		await runExtensionHandlers(extension, "input", {
+			source: "interactive",
+			text: "I'm back",
+		});
+		const afterHumanInput = await extension.tool.execute(
+			"presence-human",
+			{ question: "Normal again?", options: ["A"] },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect(afterHumanInput.details.timeoutMs).toBe(18);
+	});
+
+	test("registers status, away, and reset availability commands", async () => {
+		stubAskAvailabilitySettings(600_000, 60_000);
+		const extension = await setupExtension();
+		const notifications: string[] = [];
+		const ctx = {
+			ui: {
+				notify(message: string) {
+					notifications.push(message);
+				},
+			},
+		};
+
+		await extension.commands.get("ask-away")?.handler("", ctx);
+		await extension.commands.get("ask-status")?.handler("", ctx);
+		expect(notifications.at(-1)).toContain("availability: away");
+		await extension.commands.get("ask-reset")?.handler("", ctx);
+		await extension.commands.get("ask-status")?.handler("", ctx);
+		expect(notifications.at(-1)).toContain("availability: normal");
 	});
 
 	test("uses PI_ASK_USER_DISPLAY_MODE env var when call-level displayMode is omitted", async () => {
@@ -595,7 +780,122 @@ describe("ask_user", () => {
 		expect(notifications[0]?.message).toContain("Yes, No");
 	});
 
+	test("reports ask_user as blocked to Herdr until the prompt closes", async () => {
+		const tool = await setupTool();
+		let closePrompt: ((value: null) => void) | undefined;
+
+		const execution = tool.execute(
+			"ask-herdr-1",
+			{ question: "Approve deployment?", options: ["Yes", "No"] },
+			undefined,
+			undefined,
+			{
+				hasUI: true,
+				ui: {
+					custom: async () =>
+						await new Promise<null>((resolve) => {
+							closePrompt = resolve;
+						}),
+				},
+			},
+		);
+
+		await waitUntil(
+			() =>
+				closePrompt !== undefined &&
+				emittedEvents.some(
+					(event) => event.name === "herdr:blocked" && event.payload.active,
+				),
+		);
+		expect(
+			emittedEvents.find(
+				(event) => event.name === "herdr:blocked" && event.payload.active,
+			)?.payload,
+		).toMatchObject({
+			active: true,
+			id: "ask-herdr-1",
+			kind: "ask_user",
+			label: "Approve deployment?",
+		});
+
+		closePrompt?.(null);
+		await execution;
+		expect(
+			emittedEvents.filter((event) => event.name === "herdr:blocked").at(-1)
+				?.payload,
+		).toMatchObject({ active: false, id: "ask-herdr-1" });
+	});
+
 	describe("Telegram notifications", () => {
+		test("accelerates Telegram delivery when the response timeout is short", async () => {
+			stubTelegramSettings("123456:TEST_TOKEN_SHORT_TIMEOUT", "4242");
+			stubEnv("PI_TELEGRAM_NOTIFY_DELAY_MS", "100");
+			const extension = await setupExtension();
+			const calls: string[] = [];
+
+			stubFetch((url) => {
+				const method = url.split("/").pop()!;
+				calls.push(method);
+				if (method === "sendMessage") {
+					return telegramOk({ message_id: 76, chat: { id: 4242 } });
+				}
+				return telegramOk([]);
+			});
+
+			const result = await extension.tool.execute(
+				"short-timeout-call",
+				{
+					question: "Quick decision?",
+					options: ["A", "B"],
+					timeout: 40,
+				},
+				undefined,
+				undefined,
+				{
+					hasUI: true,
+					ui: {
+						custom: async (factory: any) =>
+							await new Promise((resolve) => {
+								factory(
+									{ requestRender() {}, terminal: { rows: 24 } },
+									createTheme(),
+									createKeybindings(),
+									resolve,
+								);
+							}),
+					},
+				},
+			);
+
+			expect(result.details.timedOut).toBe(true);
+			expect(calls).toContain("sendMessage");
+		});
+
+		test("accepts the legacy piAskUser.telegram settings namespace", async () => {
+			stubTelegramSettings("123456:TEST_TOKEN_NAMESPACED", "4242", true);
+			const tool = await setupTool();
+			const calls: string[] = [];
+
+			stubFetch((url) => {
+				const method = url.split("/").pop()!;
+				calls.push(method);
+				if (method === "sendMessage") {
+					return telegramOk({ message_id: 77, chat: { id: 4242 } });
+				}
+				return telegramOk([]);
+			});
+
+			await tool.execute(
+				"tool-call-id",
+				{ question: "Still configured?", options: ["Yes"] },
+				undefined,
+				undefined,
+				{ hasUI: true, ui: { custom: async () => null } },
+			);
+
+			expect(calls).toContain("sendMessage");
+		});
+
 		test("sends the full question payload with quick-reply buttons", async () => {
 			stubTelegramSettings("123456:TEST_TOKEN_SEND", "4242");
 			const tool = await setupTool();
@@ -1263,6 +1563,88 @@ describe("ask_user", () => {
 	});
 
 	describe("agent_end Telegram notifications", () => {
+		test("reconciles async runs when their start event was missed", async () => {
+			stubTelegramSettings("123456:TEST_TOKEN_AGENT_END_RECONCILE", "4242");
+			stubEnv("PI_TELEGRAM_NOTIFY_DELAY_MS", "10");
+			const extension = await setupExtension();
+			const calls: string[] = [];
+
+			extension.eventHandlers.set("subagents:rpc:v1:request", [
+				(request) => {
+					emitExtensionEvent(
+						extension,
+						`subagents:rpc:v1:reply:${request.requestId}`,
+						{
+							success: true,
+							data: {
+								text: "Active async runs: 1\n\n- restored-run | running | single | step 1/1 | /tmp",
+							},
+						},
+					);
+				},
+			]);
+			emitExtensionEvent(extension, "subagents:rpc:v1:ready");
+			stubFetch((url) => {
+				calls.push(url.split("/").pop()!);
+				return telegramOk({ message_id: 506, chat: { id: 4242 } });
+			});
+
+			await runExtensionHandlers(extension, "agent_end", {
+				messages: [{ role: "assistant", content: "Root turn ended" }],
+			});
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			expect(calls).toEqual([]);
+			await runExtensionHandlers(extension, "session_shutdown");
+		});
+
+		test("waits for all async subagents before sending the idle notification", async () => {
+			stubTelegramSettings("123456:TEST_TOKEN_AGENT_END_ASYNC", "4242");
+			stubEnv("PI_TELEGRAM_NOTIFY_DELAY_MS", "10");
+			const extension = await setupExtension();
+			const calls: Array<{ method: string; body: any }> = [];
+
+			stubFetch((url, init) => {
+				calls.push({ method: url.split("/").pop()!, body: jsonBody(init) });
+				return telegramOk({ message_id: 504, chat: { id: 4242 } });
+			});
+
+			emitExtensionEvent(extension, "subagent:async-started", {
+				id: "async-run-1",
+			});
+			await runExtensionHandlers(extension, "agent_end", {
+				messages: [{ role: "assistant", content: "Background work continues" }],
+			});
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			expect(calls.some((call) => call.method === "sendRichMessage" || call.method === "sendMessage")).toBe(false);
+
+			emitExtensionEvent(extension, "subagent:async-complete", {
+				runId: "async-run-1",
+			});
+			await waitUntil(() => calls.some((call) => call.method === "sendRichMessage" || call.method === "sendMessage"));
+			await runExtensionHandlers(extension, "session_shutdown");
+		});
+
+		test("does not send Telegram notifications from subagent processes", async () => {
+			stubTelegramSettings("123456:TEST_TOKEN_CHILD_PROCESS", "4242");
+			stubEnv("PI_TELEGRAM_NOTIFY_DELAY_MS", "0");
+			stubEnv("PI_SUBAGENT_CHILD", "1");
+			const extension = await setupExtension(
+				`?subagent-process=${Date.now()}`,
+			);
+			const calls: string[] = [];
+
+			stubFetch((url) => {
+				calls.push(url.split("/").pop()!);
+				return telegramOk({ message_id: 505, chat: { id: 4242 } });
+			});
+
+			await runExtensionHandlers(extension, "agent_end", {
+				messages: [{ role: "assistant", content: "Child done" }],
+			});
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			expect(calls).toEqual([]);
+		});
+
 		test("sends an idle Telegram message only after the configured delay", async () => {
 			stubTelegramSettings("123456:TEST_TOKEN_AGENT_END_DELAY", "4242");
 			stubEnv("PI_TELEGRAM_NOTIFY_DELAY_MS", "15");
@@ -1294,15 +1676,13 @@ describe("ask_user", () => {
 				},
 			);
 
-			expect(calls.some((call) => call.method === "sendMessage")).toBe(false);
-			await waitUntil(() =>
-				calls.some((call) => call.method === "sendMessage"),
-			);
-			const sendMessage = calls.find((call) => call.method === "sendMessage");
-			expect(sendMessage?.body.chat_id).toBe("4242");
-			expect(sendMessage?.body.text).toContain("Pi agent idle");
-			expect(sendMessage?.body.text).toContain("/tmp/project");
-			expect(sendMessage?.body.text).toContain("All done. Ready?");
+			expect(calls.some((call) => call.method === "sendRichMessage" || call.method === "sendMessage")).toBe(false);
+			await waitUntil(() => calls.some((call) => call.method === "sendRichMessage" || call.method === "sendMessage"));
+			const notification = calls.find((call) => call.method === "sendRichMessage" || call.method === "sendMessage");
+			expect(notification?.body.chat_id).toBe("4242");
+			expect(notification?.body.rich_message?.html ?? notification?.body.text).toContain("Pi agent idle");
+			expect(notification?.body.rich_message?.html ?? notification?.body.text).toContain("project");
+			expect(notification?.body.rich_message?.html ?? notification?.body.text).toContain("All done. Ready?");
 			await runExtensionHandlers(extension, "session_shutdown");
 		});
 

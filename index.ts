@@ -47,6 +47,9 @@ import {
 import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+const execFileAsync = promisify(execFile);
 const _require = createRequire(import.meta.url);
 const ASK_USER_VERSION: string = (
 	_require("./package.json") as { version: string }
@@ -134,6 +137,9 @@ interface AskToolDetails {
 	options: QuestionOption[];
 	response: AskResponse | null;
 	cancelled: boolean;
+	timedOut?: boolean;
+	presenceMode?: "normal" | "away";
+	timeoutMs?: number;
 }
 
 type AskUIResult = AskResponse;
@@ -153,14 +159,41 @@ interface TelegramConfig {
 }
 
 interface TelegramNotifySettingsFile {
+	askUser?: {
+		availability?: {
+			enabled?: boolean;
+			normalTimeoutMs?: number;
+			awayTimeoutMs?: number;
+		};
+	};
 	telegram?: {
 		botToken?: string;
 		chatId?: string | number;
 	};
+	piAskUser?: {
+		telegram?: {
+			botToken?: string;
+			chatId?: string | number;
+		};
+	};
+}
+
+interface AskAvailabilityConfig {
+	enabled: boolean;
+	normalTimeoutMs: number;
+	awayTimeoutMs: number;
+}
+
+interface AskPresenceState {
+	mode: "normal" | "away";
+	updatedAt: number;
+	lastHumanActivityAt?: number;
+	awaySince?: number;
 }
 
 interface TelegramMessage {
 	message_id: number;
+	message_thread_id?: number;
 	chat?: { id?: string | number };
 }
 
@@ -168,6 +201,7 @@ interface TelegramUpdate {
 	update_id: number;
 	message?: {
 		message_id: number;
+		message_thread_id?: number;
 		chat?: { id?: string | number };
 		text?: string;
 		reply_to_message?: { message_id?: number };
@@ -194,6 +228,7 @@ interface SharedTelegramAskRecord {
 	updatedAt: number;
 	expiresAt?: number;
 	messageId?: number;
+	messageThreadId?: number;
 	status: SharedTelegramAskStatus;
 	response?: AskResponse | null;
 }
@@ -204,6 +239,8 @@ interface TelegramSharedStore {
 	lockDir: string;
 	lockFile: string;
 	offsetFile: string;
+	topicFile: string;
+	topicLockDir: string;
 }
 
 interface TelegramPollLock {
@@ -222,6 +259,16 @@ const TELEGRAM_LOCK_STALE_MS = 70_000;
 const TELEGRAM_RECORD_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const TELEGRAM_MAX_MESSAGE_LENGTH = 3_900;
 const TELEGRAM_MAX_BUTTON_TEXT_LENGTH = 52;
+const ASK_AVAILABILITY_DEFAULT_NORMAL_TIMEOUT_MS = 10 * 60_000;
+const ASK_AVAILABILITY_DEFAULT_AWAY_TIMEOUT_MS = 60_000;
+const ASK_PRESENCE_LOCK_STALE_MS = 5_000;
+const ASK_PRESENCE_LOCK_WAIT_MS = 2_000;
+const SUBAGENT_RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
+const SUBAGENT_RPC_READY_EVENT = "subagents:rpc:v1:ready";
+const SUBAGENT_RPC_REPLY_PREFIX = "subagents:rpc:v1:reply:";
+const SUBAGENT_ASYNC_STARTED_EVENT = "subagent:async-started";
+const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
+const SUBAGENT_RPC_TIMEOUT_MS = 500;
 
 let telegramRequestCounter = 0;
 
@@ -243,11 +290,138 @@ function getPiAgentSettingsPath(): string {
 	return join(process.env.HOME || homedir(), ".pi", "agent", "settings.json");
 }
 
+function validTimeoutMs(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0
+		? Math.floor(value)
+		: fallback;
+}
+
+async function resolveAskAvailabilityConfig(): Promise<AskAvailabilityConfig> {
+	const settings = await readJsonFile<TelegramNotifySettingsFile>(
+		getPiAgentSettingsPath(),
+	);
+	const availability = settings?.askUser?.availability;
+	return {
+		enabled: availability?.enabled !== false,
+		normalTimeoutMs: validTimeoutMs(
+			availability?.normalTimeoutMs,
+			ASK_AVAILABILITY_DEFAULT_NORMAL_TIMEOUT_MS,
+		),
+		awayTimeoutMs: validTimeoutMs(
+			availability?.awayTimeoutMs,
+			ASK_AVAILABILITY_DEFAULT_AWAY_TIMEOUT_MS,
+		),
+	};
+}
+
+function getAskPresencePaths(): {
+	agentDir: string;
+	stateFile: string;
+	lockDir: string;
+} {
+	const agentDir = join(process.env.HOME || homedir(), ".pi", "agent");
+	return {
+		agentDir,
+		stateFile: join(agentDir, "ask-user-presence.json"),
+		lockDir: join(agentDir, "ask-user-presence.lock"),
+	};
+}
+
+async function readAskPresenceState(): Promise<AskPresenceState> {
+	const state = await readJsonFile<AskPresenceState>(getAskPresencePaths().stateFile);
+	if (state?.mode === "away" || state?.mode === "normal") return state;
+	return { mode: "normal", updatedAt: Date.now() };
+}
+
+async function withAskPresenceLock<T>(operation: () => Promise<T>): Promise<T> {
+	const { agentDir, lockDir } = getAskPresencePaths();
+	await mkdir(agentDir, { recursive: true, mode: 0o700 });
+	const deadline = Date.now() + ASK_PRESENCE_LOCK_WAIT_MS;
+	while (true) {
+		try {
+			await mkdir(lockDir, { mode: 0o700 });
+			break;
+		} catch (error) {
+			if (!isErrno(error, "EEXIST")) throw error;
+			try {
+				const info = await stat(lockDir);
+				if (Date.now() - info.mtimeMs > ASK_PRESENCE_LOCK_STALE_MS) {
+					await rm(lockDir, { recursive: true, force: true });
+					continue;
+				}
+			} catch (statError) {
+				if (!isErrno(statError, "ENOENT")) throw statError;
+			}
+			if (Date.now() >= deadline) throw new Error("Timed out locking ask presence state");
+			await delay(25);
+		}
+	}
+
+	try {
+		return await operation();
+	} finally {
+		await rm(lockDir, { recursive: true, force: true });
+	}
+}
+
+async function writeAskPresenceState(state: AskPresenceState): Promise<void> {
+	const { stateFile } = getAskPresencePaths();
+	const tempFile = `${stateFile}.${process.pid}.${Date.now()}.tmp`;
+	await writeFile(tempFile, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+	await rename(tempFile, stateFile);
+}
+
+async function recordHumanActivity(): Promise<void> {
+	await withAskPresenceLock(async () => {
+		const now = Date.now();
+		await writeAskPresenceState({
+			mode: "normal",
+			updatedAt: now,
+			lastHumanActivityAt: now,
+		});
+	});
+}
+
+async function markUserAway(questionStartedAt: number): Promise<void> {
+	await withAskPresenceLock(async () => {
+		const current = await readAskPresenceState();
+		if ((current.lastHumanActivityAt ?? 0) > questionStartedAt) return;
+		const now = Date.now();
+		await writeAskPresenceState({
+			...current,
+			mode: "away",
+			updatedAt: now,
+			awaySince: current.awaySince ?? now,
+		});
+	});
+}
+
+async function setUserAway(): Promise<void> {
+	await withAskPresenceLock(async () => {
+		const current = await readAskPresenceState();
+		const now = Date.now();
+		await writeAskPresenceState({
+			...current,
+			mode: "away",
+			updatedAt: now,
+			awaySince: now,
+		});
+	});
+}
+
+function formatDurationMs(ms: number): string {
+	if (ms % 60_000 === 0) return `${ms / 60_000} min`;
+	if (ms % 1_000 === 0) return `${ms / 1_000} sec`;
+	return `${ms} ms`;
+}
+
 async function resolveTelegramConfig(): Promise<TelegramConfig | null> {
 	const settings = await readJsonFile<TelegramNotifySettingsFile>(
 		getPiAgentSettingsPath(),
 	);
-	const telegram = settings?.telegram;
+	// Keep accepting the original namespaced setting used by pi-ask-user
+	// installations. The top-level key, when present, takes precedence.
+	const telegram = settings?.telegram ?? settings?.piAskUser?.telegram;
 	const botToken = telegram?.botToken?.trim();
 	const rawChatId = telegram?.chatId;
 	const chatId =
@@ -275,6 +449,8 @@ function createTelegramSharedStore(
 		lockDir: join(rootDir, "poller.lock"),
 		lockFile: join(rootDir, "poller.lock", "owner.json"),
 		offsetFile: join(rootDir, "offset.json"),
+		topicFile: join(rootDir, "topics.json"),
+		topicLockDir: join(rootDir, "topics.lock"),
 	};
 }
 
@@ -302,6 +478,34 @@ function truncatePlainText(text: string, maxLength: number): string {
 	if (text.length <= maxLength) return text;
 	if (maxLength <= 1) return "…";
 	return `${text.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+function escapeTelegramHtml(text: string): string {
+	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function telegramHtml(text: string): string {
+	return escapeTelegramHtml(truncatePlainText(text, TELEGRAM_MAX_MESSAGE_LENGTH));
+}
+
+async function resolveTelegramTopicName(): Promise<string | null> {
+	try {
+		const cwd = process.cwd();
+		const [{ stdout: rootOut }, { stdout: topOut }] = await Promise.all([
+			execFileAsync("git", ["-C", cwd, "rev-parse", "--show-toplevel"]),
+			execFileAsync("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"]),
+		]);
+		const root = rootOut.trim();
+		const common = topOut.trim();
+		if (!root || !common) return null;
+		const repository = root.split("/").filter(Boolean).pop() || "repository";
+		// A linked worktree has its own .git file while the main checkout's git dir
+		// is the common directory itself.
+		const isMain = common === join(root, ".git");
+		return isMain ? repository : `${repository} · ${root.split("/").filter(Boolean).pop() || "worktree"}`;
+	} catch {
+		return null;
+	}
 }
 
 function buildLocalAskNotificationText(
@@ -334,6 +538,24 @@ function notifyAskRequested(
 		notify(buildLocalAskNotificationText(request), "info");
 	} catch {
 		// Notifications must never block the question flow.
+	}
+}
+
+function reportHerdrAskBlocked(
+	pi: ExtensionAPI,
+	active: boolean,
+	id: string,
+	label: string,
+): void {
+	try {
+		pi.events.emit("herdr:blocked", {
+			active,
+			id,
+			kind: "ask_user",
+			label,
+		});
+	} catch {
+		// Herdr integration must never interrupt the question flow.
 	}
 }
 
@@ -439,80 +661,22 @@ function buildTelegramAskMessage(
 	requestId: string,
 	request: AskNotificationRequest,
 ): string {
-	const lines = buildTelegramAskMessageLines(request);
-	const hints: string[] = [];
-	if (request.options.length > 0) {
-		hints.push("Tap a button to answer quickly.");
-		hints.push("You can also reply with the option letter or title.");
-	}
-	if (request.allowMultiple && request.options.length > 0) {
-		hints.push(
-			"For multiple selections, reply with letters separated by commas, e.g. A,C.",
-		);
-	}
-	if (request.allowFreeform) {
-		hints.push(
-			"For a custom answer, reply to this Telegram message with text.",
-		);
-	}
-	if (request.allowComment && request.options.length > 0) {
-		hints.push(
-			"To add a comment, reply with the option plus comment, e.g. A - your comment.",
-		);
-	}
-	if (hints.length > 0) {
-		lines.push("", ...hints);
-	}
-
-	void requestId; // kept hidden in Telegram callback_data, not shown in the message body.
-	return truncatePlainText(lines.join("\n"), TELEGRAM_MAX_MESSAGE_LENGTH);
+	void requestId;
+	const options = request.options.slice(0, 6).map((option, index) =>
+		`${telegramOptionLabel(index)}. ${option.title}`).join("\n");
+	return ["🔔 <b>ask_user</b>", `<b>Question</b> ${telegramHtml(request.question)}`,
+		request.options.length ? `<b>Choices</b>\n${telegramHtml(options)}` : "<i>Freeform answer requested</i>",
+		"<i>Use a button or reply to this message.</i>",
+		`<details><summary>Details</summary>${telegramHtml([request.context, request.options.map((option, index) => `${telegramOptionLabel(index)}. ${option.title}${option.description ? ` — ${option.description}` : ""}`).join("\n")].filter(Boolean).join("\n\n"))}</details>`]
+		.filter(Boolean).join("\n\n");
 }
 
-function buildTelegramAskMessageLines(
-	request: AskNotificationRequest,
-): string[] {
-	const lines = ["🔔 ask_user", "", `Question:\n${request.question}`];
-
-	if (request.context) {
-		lines.push("", `Context:\n${request.context}`);
-	}
-
-	if (request.options.length > 0) {
-		lines.push("", "Options:");
-		request.options.forEach((option, index) => {
-			const description = option.description ? ` — ${option.description}` : "";
-			lines.push(
-				`${telegramOptionLabel(index)}. ${option.title}${description}`,
-			);
-		});
-	} else {
-		lines.push("", "Freeform answer requested.");
-	}
-
-	return lines;
+function buildTelegramAnsweredMessage(record: SharedTelegramAskRecord, response: AskResponse): string {
+	return `✅ <b>Answered:</b>\n${telegramHtml(record.request.question)}\n\n<b>Response</b> ${telegramHtml(formatResponseSummary(response))}`;
 }
 
-function buildTelegramAnsweredMessage(
-	record: SharedTelegramAskRecord,
-	response: AskResponse,
-): string {
-	const body = buildTelegramAskMessageLines(record.request).join("\n");
-	const suffix = `\n\n✅ Answered:\n${formatResponseSummary(response)}`;
-	if (body.length + suffix.length <= TELEGRAM_MAX_MESSAGE_LENGTH) {
-		return `${body}${suffix}`;
-	}
-	return `${truncatePlainText(body, TELEGRAM_MAX_MESSAGE_LENGTH - suffix.length)}${suffix}`;
-}
-
-function buildTelegramCancelledAskMessage(
-	record: SharedTelegramAskRecord,
-): string {
-	const body = buildTelegramAskMessageLines(record.request).join("\n");
-	const suffix = "\n\n⚪ Cancelled before an answer was accepted.";
-	if (body.length + suffix.length <= TELEGRAM_MAX_MESSAGE_LENGTH) {
-		return `${body}${suffix}`;
-	}
-	return `${truncatePlainText(body, TELEGRAM_MAX_MESSAGE_LENGTH - suffix.length)}${suffix}`;
+function buildTelegramCancelledAskMessage(record: SharedTelegramAskRecord): string {
+	return `⚪ <b>Cancelled</b>\n${telegramHtml(record.request.question)}`;
 }
 
 function normalizeTelegramToken(value: string): string {
@@ -759,12 +923,10 @@ async function cleanupExpiredSharedAsks(
 	const records = await listSharedAsks(store);
 	await Promise.all(
 		records.map(async (record) => {
-			const expiredByTimeout =
-				record.expiresAt !== undefined && record.expiresAt <= now;
+			const expiredByTimeout = record.expiresAt !== undefined && record.expiresAt <= now;
 			const expiredByAge = now - record.createdAt > TELEGRAM_RECORD_MAX_AGE_MS;
-			if (expiredByTimeout || expiredByAge || record.status === "cancelled") {
-				await removeSharedAsk(store, record.id);
-			}
+			if (expiredByTimeout || expiredByAge || record.status === "cancelled") await removeSharedAsk(store, record.id);
+			return undefined;
 		}),
 	);
 }
@@ -855,9 +1017,26 @@ async function tryAcquireTelegramPollLock(
 	};
 }
 
+interface TelegramTopicMap { topics: Record<string, number> }
+
+async function withTelegramTopicLock<T>(store: TelegramSharedStore, operation: () => Promise<T>): Promise<T> {
+	const deadline = Date.now() + 5_000;
+	while (true) {
+		try { await mkdir(store.topicLockDir, { mode: 0o700 }); break; } catch (error) {
+			if (!isErrno(error, "EEXIST")) throw error;
+			const info = await stat(store.topicLockDir).catch(() => null);
+			if (info && Date.now() - info.mtimeMs > 10_000) { await rm(store.topicLockDir, { recursive: true, force: true }); continue; }
+			if (Date.now() >= deadline) throw new Error("Timed out locking Telegram topic state");
+			await delay(25);
+		}
+	}
+	try { return await operation(); } finally { await rm(store.topicLockDir, { recursive: true, force: true }); }
+}
+
 class TelegramBotPoller {
 	private readonly config: TelegramConfig;
 	private readonly store: TelegramSharedStore;
+	private topicId: number | null | undefined;
 	private abortController: AbortController | undefined;
 	private loopPromise: Promise<void> | undefined;
 	private ensurePromise: Promise<void> | undefined;
@@ -875,11 +1054,8 @@ class TelegramBotPoller {
 		return await readSharedAsk(this.store, id);
 	}
 
-	async updateMessageId(id: string, messageId: number): Promise<void> {
-		await updateSharedAsk(this.store, id, (record) => ({
-			...record,
-			messageId,
-		}));
+	async updateMessageId(id: string, messageId: number, messageThreadId?: number): Promise<void> {
+		await updateSharedAsk(this.store, id, (record) => ({ ...record, messageId, messageThreadId }));
 	}
 
 	async removePendingAsk(id: string): Promise<void> {
@@ -901,59 +1077,62 @@ class TelegramBotPoller {
 			};
 		});
 
-		if (updated?.messageId !== undefined) {
-			await this.safeCallApi("editMessageText", {
-				chat_id: this.config.chatId,
-				message_id: updated.messageId,
-				text: buildTelegramCancelledAskMessage(updated),
-				reply_markup: { inline_keyboard: [] },
-			});
-		}
+		if (updated?.messageId !== undefined) await this.editNotificationMessage(updated.messageId, buildTelegramCancelledAskMessage(updated), { inline_keyboard: [] }, updated.messageThreadId);
 	}
 
 	async sendMessage(pending: TelegramPendingAsk): Promise<TelegramMessage> {
-		return await this.sendNotificationMessage(
-			buildTelegramAskMessage(pending.id, pending.request),
-			buildTelegramInlineKeyboard(pending.id, pending.request),
-		);
+		return await this.sendNotificationMessage(buildTelegramAskMessage(pending.id, pending.request), buildTelegramInlineKeyboard(pending.id, pending.request));
 	}
 
-	async sendNotificationMessage(
-		text: string,
-		replyMarkup?: Record<string, unknown>,
-	): Promise<TelegramMessage> {
-		const controller = new AbortController();
-		const timeout = setTimeout(
-			() => controller.abort(),
-			TELEGRAM_SEND_TIMEOUT_MS,
-		);
+	private async getMessageThreadId(): Promise<number | undefined> {
+		if (this.topicId !== undefined) return this.topicId ?? undefined;
+		this.topicId = null;
 		try {
-			return await this.callApi<TelegramMessage>(
-				"sendMessage",
-				{
-					chat_id: this.config.chatId,
-					text: truncatePlainText(text, TELEGRAM_MAX_MESSAGE_LENGTH),
-					disable_web_page_preview: true,
-					...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-				},
-				controller.signal,
-			);
-		} finally {
-			clearTimeout(timeout);
-		}
+			const me = await this.callApi<{ has_topics_enabled?: boolean }>("getMe", {});
+			if (!me.has_topics_enabled) return undefined;
+			const name = await resolveTelegramTopicName();
+			if (!name) return undefined;
+			const key = createHash("sha256").update(name).digest("hex");
+			this.topicId = await withTelegramTopicLock(this.store, async () => {
+				const map = (await readJsonFile<TelegramTopicMap>(this.store.topicFile)) ?? { topics: {} };
+				const existing = map.topics[key];
+				if (existing) return existing;
+				const topic = await this.callApi<{ message_thread_id: number }>("createForumTopic", { chat_id: this.config.chatId, name: truncatePlainText(name, 128) });
+				map.topics[key] = topic.message_thread_id;
+				await writeJsonFileAtomic(this.store.topicFile, map);
+				return topic.message_thread_id;
+			});
+		} catch { this.topicId = null; }
+		return this.topicId ?? undefined;
 	}
 
-	async editNotificationMessage(
-		messageId: number,
-		text: string,
-		replyMarkup?: Record<string, unknown>,
-	): Promise<void> {
-		await this.safeCallApi("editMessageText", {
-			chat_id: this.config.chatId,
-			message_id: messageId,
-			text: truncatePlainText(text, TELEGRAM_MAX_MESSAGE_LENGTH),
-			...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-		});
+	private async invalidateTopic(): Promise<void> {
+		this.topicId = undefined;
+		await withTelegramTopicLock(this.store, async () => { await rm(this.store.topicFile, { force: true }); });
+	}
+
+	async sendNotificationMessage(text: string, replyMarkup?: Record<string, unknown>): Promise<TelegramMessage> {
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), TELEGRAM_SEND_TIMEOUT_MS);
+		const send = async (threadId?: number): Promise<TelegramMessage> => {
+			const body = { chat_id: this.config.chatId, rich_message: { type: "html", html: text }, disable_web_page_preview: true, ...(threadId !== undefined ? { message_thread_id: threadId } : {}), ...(replyMarkup ? { reply_markup: replyMarkup } : {}) };
+			try {
+				const message = await this.callApi<TelegramMessage>("sendRichMessage", body, controller.signal);
+				if (typeof message?.message_id !== "number") throw new Error("sendRichMessage returned no message id");
+				return message;
+			} catch { return await this.callApi<TelegramMessage>("sendMessage", { ...body, text: truncatePlainText(text.replace(/<[^>]*>/g, ""), TELEGRAM_MAX_MESSAGE_LENGTH), parse_mode: "HTML" }, controller.signal); }
+		};
+		try {
+			const threadId = await this.getMessageThreadId();
+			try { return await send(threadId); }
+			catch (error) { if (threadId === undefined) throw error; await this.invalidateTopic(); try { return await send(await this.getMessageThreadId()); } catch { return await send(); } }
+		} finally { clearTimeout(timeout); }
+	}
+
+	async editNotificationMessage(messageId: number, text: string, replyMarkup?: Record<string, unknown>, messageThreadId?: number): Promise<void> {
+		const body = { chat_id: this.config.chatId, message_id: messageId, rich_message: { type: "html", html: text }, text: truncatePlainText(text.replace(/<[^>]*>/g, ""), TELEGRAM_MAX_MESSAGE_LENGTH), parse_mode: "HTML", ...(messageThreadId !== undefined ? { message_thread_id: messageThreadId } : {}), ...(replyMarkup ? { reply_markup: replyMarkup } : {}) };
+		try { await this.callApi("editMessageText", body); }
+		catch { await this.safeCallApi("editMessageText", { ...body, text: truncatePlainText(text.replace(/<[^>]*>/g, ""), TELEGRAM_MAX_MESSAGE_LENGTH), parse_mode: "HTML" }); }
 	}
 
 	async ensurePolling(): Promise<void> {
@@ -1040,7 +1219,8 @@ class TelegramBotPoller {
 		if (
 			!record ||
 			record.status !== "pending" ||
-			!telegramChatMatches(callbackQuery.message?.chat, this.config)
+			!telegramChatMatches(callbackQuery.message?.chat, this.config) ||
+			(record.messageThreadId !== undefined && callbackQuery.message?.message_thread_id !== record.messageThreadId)
 		) {
 			await this.safeCallApi("answerCallbackQuery", {
 				callback_query_id: callbackQuery.id,
@@ -1065,11 +1245,7 @@ class TelegramBotPoller {
 				text: "Reply to the ask_user message with your custom answer.",
 				show_alert: false,
 			});
-			await this.safeCallApi("sendMessage", {
-				chat_id: this.config.chatId,
-				reply_to_message_id: callbackQuery.message?.message_id,
-				text: "Reply to the ask_user message with your custom answer.",
-			});
+			await this.safeCallApi("sendMessage", { chat_id: this.config.chatId, reply_to_message_id: callbackQuery.message?.message_id, ...(record.messageThreadId !== undefined ? { message_thread_id: record.messageThreadId } : {}), text: "Reply to the ask_user message with your custom answer." });
 			return;
 		}
 
@@ -1104,18 +1280,14 @@ class TelegramBotPoller {
 		const records = await listSharedAsks(this.store);
 		const record = records.find(
 			(candidate) =>
-				candidate.status === "pending" &&
-				candidate.messageId === replyToMessageId,
+				candidate.status === "pending" && candidate.messageId === replyToMessageId &&
+				(candidate.messageThreadId === undefined || candidate.messageThreadId === message.message_thread_id),
 		);
 		if (!record || !message.text) return;
 
 		const response = parseTelegramTextResponse(message.text, record.request);
 		if (!response) {
-			await this.safeCallApi("sendMessage", {
-				chat_id: this.config.chatId,
-				reply_to_message_id: message.message_id,
-				text: "I could not match that reply to an available ask_user answer. Try the option letter, the option title, or a freeform reply if allowed.",
-			});
+			await this.safeCallApi("sendMessage", { chat_id: this.config.chatId, reply_to_message_id: message.message_id, ...(record.messageThreadId !== undefined ? { message_thread_id: record.messageThreadId } : {}), text: "I could not match that reply to an available ask_user answer. Try an option button, letter, or title.", parse_mode: "HTML" });
 			return;
 		}
 
@@ -1135,14 +1307,7 @@ class TelegramBotPoller {
 			};
 		});
 
-		if (updated?.messageId !== undefined) {
-			await this.safeCallApi("editMessageText", {
-				chat_id: this.config.chatId,
-				message_id: updated.messageId,
-				text: buildTelegramAnsweredMessage(updated, response),
-				reply_markup: { inline_keyboard: [] },
-			});
-		}
+		if (updated?.messageId !== undefined) await this.editNotificationMessage(updated.messageId, buildTelegramAnsweredMessage(updated, response), { inline_keyboard: [] }, updated.messageThreadId);
 	}
 
 	private async safeCallApi(
@@ -1175,9 +1340,11 @@ class TelegramBotPoller {
 			},
 		);
 		const text = await response.text();
-		const payload = text
-			? (JSON.parse(text) as { ok?: boolean; result?: T; description?: string })
-			: {};
+		let payload: { ok?: boolean; result?: T; description?: string } = {};
+		if (text) {
+			try { payload = JSON.parse(text) as typeof payload; }
+			catch { throw new Error(`Telegram ${method} returned invalid JSON`); }
+		}
 		if (!response.ok || payload.ok !== true) {
 			throw new Error(
 				payload.description ||
@@ -1226,7 +1393,11 @@ class TelegramPendingAsk implements TelegramAskHandle {
 		});
 
 		const delayMs = resolveTelegramNotifyDelayMs();
-		if (delayMs <= 0) {
+		const effectiveDelayMs =
+			this.request.timeout && this.request.timeout <= delayMs * 2
+				? Math.min(delayMs, 5_000, Math.floor(this.request.timeout / 10))
+				: delayMs;
+		if (effectiveDelayMs <= 10) {
 			await this.deliver();
 			return;
 		}
@@ -1236,7 +1407,7 @@ class TelegramPendingAsk implements TelegramAskHandle {
 			void this.deliver().catch(async () => {
 				await this.finish(null, true);
 			});
-		}, delayMs);
+		}, effectiveDelayMs);
 	}
 
 	async answer(response: AskUIResult): Promise<void> {
@@ -1269,7 +1440,7 @@ class TelegramPendingAsk implements TelegramAskHandle {
 				return;
 			}
 
-			await this.poller.updateMessageId(this.id, message.message_id);
+			await this.poller.updateMessageId(this.id, message.message_id, message.message_thread_id);
 			this.startWaitingForSharedResponse();
 			void this.poller.ensurePolling();
 		} catch (error) {
@@ -1405,6 +1576,7 @@ async function startTelegramAsk(
 	request: AskNotificationRequest,
 	ctx: unknown,
 ): Promise<TelegramAskHandle | null> {
+	if (process.env.PI_SUBAGENT_CHILD === "1") return null;
 	try {
 		return await telegramNotifyManager.openAsk(request);
 	} catch (error) {
@@ -1480,6 +1652,58 @@ class AgentEndTelegramNotice {
 
 let pendingAgentEndTelegramNotice: AgentEndTelegramNotice | null = null;
 
+function subagentRunId(data: unknown): string | undefined {
+	const value = data as { id?: unknown; runId?: unknown } | undefined;
+	const id = value?.id ?? value?.runId;
+	return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+function activeAsyncRunIdsFromStatusReply(reply: unknown): Set<string> | undefined {
+	const value = reply as
+		| { success?: unknown; data?: { text?: unknown } }
+		| undefined;
+	if (value?.success !== true || typeof value.data?.text !== "string") {
+		return undefined;
+	}
+
+	const ids = new Set<string>();
+	for (const line of value.data.text.split(/\r?\n/)) {
+		const match = line.match(/^-\s+([^|]+?)\s+\|\s+(?:queued|running)\b/);
+		if (match?.[1]) ids.add(match[1].trim());
+	}
+	return ids;
+}
+
+function queryActiveAsyncRunIds(pi: ExtensionAPI): Promise<Set<string> | undefined> {
+	return new Promise((resolve) => {
+		const requestId = `telegram-idle-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		const replyEvent = `${SUBAGENT_RPC_REPLY_PREFIX}${requestId}`;
+		let settled = false;
+		let unsubscribe: (() => void) | undefined;
+
+		const finish = (ids?: Set<string>) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			unsubscribe?.();
+			resolve(ids);
+		};
+
+		unsubscribe = pi.events.on(replyEvent, (reply) => {
+			finish(activeAsyncRunIdsFromStatusReply(reply));
+		});
+		const timeout = setTimeout(() => finish(), SUBAGENT_RPC_TIMEOUT_MS);
+		timeout.unref?.();
+		pi.events.emit(SUBAGENT_RPC_REQUEST_EVENT, {
+			version: 1,
+			requestId,
+			method: "status",
+			params: {},
+			source: { extension: "pi-telegram-notify" },
+		});
+	});
+}
+
 function cancelPendingAgentEndTelegramNotice(): void {
 	const pending = pendingAgentEndTelegramNotice;
 	pendingAgentEndTelegramNotice = null;
@@ -1496,36 +1720,13 @@ function scheduleAgentEndTelegramNotice(event: unknown, ctx: unknown): void {
 }
 
 function buildAgentEndTelegramMessage(event: unknown, ctx: unknown): string {
-	const context = (ctx ?? {}) as {
-		cwd?: string;
-		model?: { name?: string; id?: string; provider?: string };
-		sessionManager?: { getSessionId?: () => string | undefined };
-	};
-	const lines = [
-		"🔔 Pi agent idle",
-		"",
-		"The agent finished and is waiting for input.",
-	];
-	if (context.cwd) lines.push("", `Project:\n${context.cwd}`);
-	const modelLabel = context.model?.name || context.model?.id;
-	if (modelLabel) {
-		lines.push(
-			"",
-			`Model:\n${context.model?.provider ? `${context.model.provider}/` : ""}${modelLabel}`,
-		);
-	}
-	const sessionId = safeCall(() => context.sessionManager?.getSessionId?.());
-	if (sessionId) lines.push("", `Session:\n${sessionId}`);
-
-	const lastAssistantText = extractLastAssistantText(event);
-	if (lastAssistantText) {
-		lines.push(
-			"",
-			`Last response:\n${truncatePlainText(lastAssistantText, 1_500)}`,
-		);
-	}
-
-	return truncatePlainText(lines.join("\n"), TELEGRAM_MAX_MESSAGE_LENGTH);
+	const context = (ctx ?? {}) as { cwd?: string; model?: { name?: string; id?: string; provider?: string }; sessionManager?: { getSessionId?: () => string | undefined } };
+	const project = context.cwd?.split("/").filter(Boolean).pop();
+	const model = context.model?.name || context.model?.id;
+	const session = safeCall(() => context.sessionManager?.getSessionId?.());
+	const lastResponse = extractLastAssistantText(event);
+	return ["🔔 <b>Pi agent idle</b>", project ? `<b>Project</b> ${telegramHtml(project)}` : "", "Finished and waiting for your next input.",
+		`<details><summary>Details</summary>${telegramHtml([model ? `Model: ${context.model?.provider ? `${context.model.provider}/` : ""}${model}` : "", session ? `Session: ${session}` : "", lastResponse ? `Last response:\n${truncatePlainText(lastResponse, 1_500)}` : ""].filter(Boolean).join("\n\n"))}</details>`].filter(Boolean).join("\n\n");
 }
 
 function safeCall<T>(fn: () => T): T | undefined {
@@ -3164,17 +3365,107 @@ async function askViaDialogs(
 }
 
 export default function (pi: ExtensionAPI) {
-	pi.on("input", async () => {
+	const activeAsyncRunIds = new Set<string>();
+	let asyncEventRevision = 0;
+	let subagentRpcAvailable = false;
+	let deferredAgentEnd:
+		| { event: unknown; ctx: unknown }
+		| undefined;
+
+	pi.events.on(SUBAGENT_RPC_READY_EVENT, () => {
+		subagentRpcAvailable = true;
+	});
+	pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, (data) => {
+		const id = subagentRunId(data);
+		if (!id) return;
+		asyncEventRevision += 1;
+		activeAsyncRunIds.add(id);
+		cancelPendingAgentEndTelegramNotice();
+	});
+	pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, (data) => {
+		const id = subagentRunId(data);
+		if (!id) return;
+		asyncEventRevision += 1;
+		activeAsyncRunIds.delete(id);
+		if (activeAsyncRunIds.size > 0 || !deferredAgentEnd) return;
+
+		const deferred = deferredAgentEnd;
+		deferredAgentEnd = undefined;
+		scheduleAgentEndTelegramNotice(deferred.event, deferred.ctx);
+	});
+
+	pi.on("input", async (event) => {
+		if (event.source !== "extension") {
+			await recordHumanActivity().catch(() => undefined);
+		}
+		deferredAgentEnd = undefined;
 		cancelPendingAgentEndTelegramNotice();
 	});
 	pi.on("before_agent_start", async () => {
+		deferredAgentEnd = undefined;
 		cancelPendingAgentEndTelegramNotice();
 	});
 	pi.on("agent_end", async (event, ctx) => {
+		if (process.env.PI_SUBAGENT_CHILD === "1") return;
+
+		if (subagentRpcAvailable) {
+			const revision = asyncEventRevision;
+			const reconciled = await queryActiveAsyncRunIds(pi);
+			if (reconciled && revision === asyncEventRevision) {
+				activeAsyncRunIds.clear();
+				for (const id of reconciled) activeAsyncRunIds.add(id);
+			}
+		}
+
+		if (activeAsyncRunIds.size > 0) {
+			deferredAgentEnd = { event, ctx };
+			cancelPendingAgentEndTelegramNotice();
+			return;
+		}
+
 		scheduleAgentEndTelegramNotice(event, ctx);
 	});
 	pi.on("session_shutdown", async () => {
+		deferredAgentEnd = undefined;
+		activeAsyncRunIds.clear();
 		cancelPendingAgentEndTelegramNotice();
+	});
+
+	pi.registerCommand("ask-status", {
+		description: "Show ask_user availability mode and response timeouts",
+		handler: async (_args, ctx) => {
+			const [config, presence] = await Promise.all([
+				resolveAskAvailabilityConfig(),
+				readAskPresenceState(),
+			]);
+			ctx.ui.notify(
+				[
+					`ask_user availability: ${config.enabled ? presence.mode : "disabled"}`,
+					`Normal timeout: ${formatDurationMs(config.normalTimeoutMs)}`,
+					`Away timeout: ${formatDurationMs(config.awayTimeoutMs)}`,
+					presence.awaySince
+						? `Away since: ${new Date(presence.awaySince).toLocaleString()}`
+						: undefined,
+				]
+					.filter((line): line is string => Boolean(line))
+					.join("\n"),
+				"info",
+			);
+		},
+	});
+	pi.registerCommand("ask-reset", {
+		description: "Reset ask_user availability to normal",
+		handler: async (_args, ctx) => {
+			await recordHumanActivity();
+			ctx.ui.notify("ask_user availability reset to normal", "info");
+		},
+	});
+	pi.registerCommand("ask-away", {
+		description: "Set ask_user availability to away (one-minute timeout by default)",
+		handler: async (_args, ctx) => {
+			await setUserAway();
+			ctx.ui.notify("ask_user availability set to away", "info");
+		},
 	});
 
 	pi.registerTool({
@@ -3189,6 +3480,7 @@ export default function (pi: ExtensionAPI) {
 			"Use ask_user when the user's intent is ambiguous, when a decision requires explicit user input, or when multiple valid options exist.",
 			"Ask exactly one focused question per ask_user call.",
 			"Do not combine multiple numbered, multipart, or unrelated questions into one ask_user prompt.",
+			"If ask_user times out, do not immediately repeat the question. Choose a safe or clearly recommended option and continue, or call pause_goal when an active goal cannot proceed without the user.",
 		],
 		parameters: Type.Object({
 			question: Type.String({ description: "The question to ask the user" }),
@@ -3253,12 +3545,12 @@ export default function (pi: ExtensionAPI) {
 			timeout: Type.Optional(
 				Type.Number({
 					description:
-						"Auto-dismiss after N milliseconds. Returns null (cancelled) when expired.",
+						"Optional per-call timeout in milliseconds. The configured availability timeout is always an upper bound. On expiry, the tool returns guidance to continue safely or pause an active goal.",
 				}),
 			),
 		}),
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			if (signal?.aborted) {
 				return {
 					content: [{ type: "text", text: "Cancelled" }],
@@ -3281,8 +3573,37 @@ export default function (pi: ExtensionAPI) {
 				displayMode,
 				overlayToggleKey,
 				commentToggleKey,
-				timeout,
+				timeout: requestedTimeout,
 			} = params as AskParams;
+			const questionStartedAt = Date.now();
+			const availability = await resolveAskAvailabilityConfig().catch(() => ({
+				enabled: true,
+				normalTimeoutMs: ASK_AVAILABILITY_DEFAULT_NORMAL_TIMEOUT_MS,
+				awayTimeoutMs: ASK_AVAILABILITY_DEFAULT_AWAY_TIMEOUT_MS,
+			}));
+			const presence = availability.enabled
+				? await readAskPresenceState().catch(() => ({
+						mode: "normal" as const,
+						updatedAt: questionStartedAt,
+					}))
+				: { mode: "normal" as const, updatedAt: questionStartedAt };
+			const policyTimeout =
+				presence.mode === "away"
+					? availability.awayTimeoutMs
+					: availability.normalTimeoutMs;
+			const timeout = availability.enabled
+				? requestedTimeout && requestedTimeout > 0
+					? Math.min(requestedTimeout, policyTimeout)
+					: policyTimeout
+				: requestedTimeout;
+			let timeoutReached = false;
+			const timeoutMarker =
+				timeout && timeout > 0
+					? setTimeout(() => {
+							timeoutReached = true;
+						}, timeout)
+					: undefined;
+			timeoutMarker?.unref?.();
 			const envMode = process.env.PI_ASK_USER_DISPLAY_MODE;
 			const envDisplayMode: AskDisplayMode | undefined =
 				envMode === "overlay" || envMode === "inline" ? envMode : undefined;
@@ -3312,6 +3633,67 @@ export default function (pi: ExtensionAPI) {
 				timeout,
 			});
 			notifyAskRequested(ctx, askNotificationRequest);
+			reportHerdrAskBlocked(pi, true, toolCallId, question);
+			const didTimeOut = () =>
+				timeoutReached ||
+				Boolean(
+					timeout &&
+						timeout > 0 &&
+						Date.now() - questionStartedAt >= Math.max(0, timeout - 25),
+				);
+			const recordHuman = async () => {
+				await recordHumanActivity().catch(() => undefined);
+			};
+			const cancelledResult = async (manualActivity: boolean) => {
+				if (didTimeOut()) {
+					await markUserAway(questionStartedAt).catch(() => undefined);
+					pi.events.emit("ask:timed_out", {
+						question,
+						context: normalizedContext,
+						options,
+						timeoutMs: timeout,
+						presenceMode: presence.mode,
+					});
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text:
+									"The user is unavailable: ask_user timed out. Do not repeat this question immediately. If a safe or clearly recommended option exists, choose it and continue while stating the assumption. If user input is essential, authorization is required, or the action is irreversible, stop. When a pi goal is active, call pause_goal with this blocker.",
+							},
+						],
+						details: {
+							question,
+							context: normalizedContext,
+							options,
+							response: null,
+							cancelled: true,
+							timedOut: true,
+							presenceMode: presence.mode,
+							timeoutMs: timeout,
+						} as AskToolDetails,
+					};
+				}
+
+				if (manualActivity) await recordHuman();
+				pi.events.emit("ask:cancelled", {
+					question,
+					context: normalizedContext,
+					options,
+				});
+				return {
+					content: [{ type: "text" as const, text: "User cancelled the question" }],
+					details: {
+						question,
+						context: normalizedContext,
+						options,
+						response: null,
+						cancelled: true,
+					} as AskToolDetails,
+				};
+			};
+
+			try {
 			const telegramHandle = await startTelegramAsk(
 				askNotificationRequest,
 				ctx,
@@ -3326,6 +3708,7 @@ export default function (pi: ExtensionAPI) {
 				if (telegramHandle) {
 					const telegramResponse = await telegramHandle.response;
 					if (telegramResponse) {
+						await recordHuman();
 						pi.events.emit("ask:answered", {
 							question,
 							context: normalizedContext,
@@ -3348,21 +3731,7 @@ export default function (pi: ExtensionAPI) {
 						};
 					}
 
-					pi.events.emit("ask:cancelled", {
-						question,
-						context: normalizedContext,
-						options,
-					});
-					return {
-						content: [{ type: "text", text: "User cancelled the question" }],
-						details: {
-							question,
-							context: normalizedContext,
-							options,
-							response: null,
-							cancelled: true,
-						} as AskToolDetails,
-					};
+					return await cancelledResult(false);
 				}
 
 				const optionText =
@@ -3416,19 +3785,11 @@ export default function (pi: ExtensionAPI) {
 
 				if (!response) {
 					telegramHandle?.close();
-					return {
-						content: [{ type: "text", text: "User cancelled the question" }],
-						details: {
-							question,
-							context: normalizedContext,
-							options,
-							response: null,
-							cancelled: true,
-						} as AskToolDetails,
-					};
+					return await cancelledResult(true);
 				}
 
 				await telegramHandle?.answer(response);
+				await recordHuman();
 
 				pi.events.emit("ask:answered", {
 					question,
@@ -3471,6 +3832,7 @@ export default function (pi: ExtensionAPI) {
 			let customDoneFromTelegram:
 				| ((result: AskUIResult | null) => void)
 				| undefined;
+			let customTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
 			let telegramResultReady = false;
 			let telegramResult: AskUIResult | null = null;
 
@@ -3508,7 +3870,8 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					if (timeout && timeout > 0) {
-						setTimeout(() => bridgedDone(null), timeout);
+						customTimeoutTimer = setTimeout(() => bridgedDone(null), timeout);
+						customTimeoutTimer.unref?.();
 					}
 
 					return new AskComponent(
@@ -3596,29 +3959,17 @@ export default function (pi: ExtensionAPI) {
 				};
 			} finally {
 				resultCompleted = true;
+				if (customTimeoutTimer) clearTimeout(customTimeoutTimer);
 				removeOverlayInputListener?.();
 			}
 
 			if (result === null) {
 				telegramHandle?.close();
-				pi.events.emit("ask:cancelled", {
-					question,
-					context: normalizedContext,
-					options,
-				});
-				return {
-					content: [{ type: "text", text: "User cancelled the question" }],
-					details: {
-						question,
-						context: normalizedContext,
-						options,
-						response: null,
-						cancelled: true,
-					} as AskToolDetails,
-				};
+				return await cancelledResult(true);
 			}
 
 			await telegramHandle?.answer(result);
+			await recordHuman();
 			pi.events.emit("ask:answered", {
 				question,
 				context: normalizedContext,
@@ -3639,6 +3990,10 @@ export default function (pi: ExtensionAPI) {
 					cancelled: false,
 				} as AskToolDetails,
 			};
+			} finally {
+				if (timeoutMarker) clearTimeout(timeoutMarker);
+				reportHerdrAskBlocked(pi, false, toolCallId, question);
+			}
 		},
 
 		renderCall(args, theme) {
@@ -3683,6 +4038,14 @@ export default function (pi: ExtensionAPI) {
 						.join("\n")
 						.trim() || "Waiting for user input...";
 				return new Text(theme.fg("muted", waitingText), 0, 0);
+			}
+
+			if (details?.timedOut) {
+				return new Text(
+					theme.fg("warning", `Timed out (${formatDurationMs(details.timeoutMs ?? 0)})`),
+					0,
+					0,
+				);
 			}
 
 			if (!details || details.cancelled || !details.response) {

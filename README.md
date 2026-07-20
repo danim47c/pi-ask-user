@@ -19,6 +19,7 @@ High-quality video: [ask-user-demo.mp4](./media/ask-user-demo.mp4)
 - Configurable display mode: `overlay` (modal, default) or `inline` (rendered directly in the flow)
 - Runtime overlay toggle: press the configured overlay-toggle key (`alt+o` by default, configurable per call or via env var) while the prompt is open to temporarily hide/show the popup so you can read prior agent output, then press it again to bring it back
 - Local Pi notification every time an `ask_user` prompt opens
+- Herdr integration: reports the root agent as `blocked` while an `ask_user` prompt is open and restores its normal state when the prompt closes
 - Telegram notifications for `ask_user` prompts, delayed by 60 seconds so quick local answers suppress the Telegram message
 - A/B/C-style Telegram quick-reply buttons and reply-to-message answers for prompts
 - Telegram idle notifications on `agent_end`, also delayed by 60 seconds and cancelled if the user responds first
@@ -123,6 +124,44 @@ Effective order for both `overlayToggleKey` and `commentToggleKey`:
 
 Pass `"off"`, `"none"`, or `"disabled"` (at any level) to disable the shortcut entirely. Invalid specs are silently dropped and the next source is used. Specs follow the Pi-TUI [`KeyId`](https://github.com/earendil-works/pi-mono/blob/main/packages/tui/src/keys.ts) format: `[mod+]...key` where modifiers are `ctrl`, `shift`, `alt`, `super`, in any order, joined by `+` (e.g. `ctrl+g`, `alt+shift+x`, `escape`, `tab`).
 
+### Availability timeouts
+
+By default, `ask_user` waits up to 10 minutes. The first timeout marks the user
+as away globally; subsequent questions from any Pi session wait one minute.
+Interactive/RPC input, local answers, Telegram answers, and manual cancellation
+reset availability to normal. Extension-generated input, including automatic
+goal continuations, does not reset it.
+
+Configure the policy in `~/.pi/agent/settings.json`:
+
+```json
+{
+  "askUser": {
+    "availability": {
+      "enabled": true,
+      "normalTimeoutMs": 600000,
+      "awayTimeoutMs": 60000
+    }
+  }
+}
+```
+
+An explicit per-call `timeout` can shorten, but never extend, the configured
+limit. Set `enabled` to `false` to restore the old behavior where only explicit
+per-call timeouts apply. Availability is shared through
+`~/.pi/agent/ask-user-presence.json` with atomic cross-session updates.
+
+Commands:
+
+- `/ask-status` — show the current mode and configured limits.
+- `/ask-away` — manually use the shorter away timeout.
+- `/ask-reset` — return to normal mode.
+
+On timeout, the tool tells the agent not to repeat the question immediately: it
+must choose a safe/recommended option and state the assumption, or call
+`pause_goal` when an active goal cannot proceed safely without the user. This
+prevents goal auto-continuation from remaining blocked forever.
+
 ### Telegram notifications
 
 Add top-level `telegram` settings to `~/.pi/agent/settings.json`:
@@ -136,12 +175,18 @@ Add top-level `telegram` settings to `~/.pi/agent/settings.json`:
 }
 ```
 
+For compatibility with earlier `pi-ask-user` installations, the namespaced
+form `piAskUser.telegram` is also accepted. If both forms exist, the top-level
+`telegram` settings take precedence.
+
 When both settings are present, `pi-telegram-notify` sends:
 
-- `ask_user` prompt notifications after a 60-second grace period. If the prompt is answered locally before that minute elapses, no Telegram message is sent.
-- Agent idle notifications on Pi's `agent_end` event after the same 60-second grace period. If the user responds or a new turn starts before then, no Telegram message is sent.
+- `ask_user` prompt notifications after a 60-second grace period. If the active availability timeout is too short for that delay, Telegram delivery is accelerated automatically. If the prompt is answered locally first, no Telegram message is sent.
+- Agent idle notifications on Pi's `agent_end` event after the same 60-second grace period. If the user responds, a new turn starts, or async subagents are still running, no Telegram message is sent. The idle notification is deferred until the final async run completes, and subagent child processes never send their own Telegram notifications.
 
-The `ask_user` Telegram message includes the question, context, options/descriptions, and inline quick-reply buttons labelled `A`, `B`, `C`, etc. The internal request id is hidden in Telegram `callback_data`, not printed in the message. Pressing an option button answers the matching prompt. You can also reply to the Telegram message with an option letter/title; for multi-select prompts, reply with comma-separated letters such as `A,C`. If `allowComment` is enabled, include a comment as `A - your comment` (or `A,C - your comment`). If `allowFreeform` is enabled, Telegram also shows a `Custom answer` button that prompts you to reply with custom text.
+The `ask_user` Telegram message is compact, HTML-escaped, and uses inline quick-reply buttons labelled `A`, `B`, `C`, etc.; longer context and option descriptions are in a collapsible details section. The internal request id is hidden in Telegram `callback_data`, not printed in the message. Pressing an option button answers the matching prompt. You can also reply to the Telegram message with an option letter/title; for multi-select prompts, reply with comma-separated letters such as `A,C`. If `allowComment` is enabled, include a comment as `A - your comment` (or `A,C - your comment`). If `allowFreeform` is enabled, Telegram also shows a `Custom answer` button that prompts you to reply with custom text.
+
+When the bot reports `has_topics_enabled`, notifications are automatically grouped into private-chat forum topics. The main checkout is named after the repository (for example `pi-ask-user`); linked worktrees are named `repository · worktree` (for example `pi-ask-user · feature-telegram-topics`). Topic creation and reuse are shared safely across Pi sessions. If topics are unavailable or a topic is deleted, delivery transparently falls back to the general chat. Configure topics in BotFather/your Telegram chat before enabling them; no topic configuration is required for the fallback. Only replies to existing `ask_user` messages are consumed—ordinary topic messages do not start Pi sessions.
 
 Multiple prompts can be open at the same time: each Telegram callback/reply is correlated by hidden request id and Telegram message id so the answer returns to the correct `ask_user` call. After an answer is accepted, the original Telegram prompt is edited to show `✅ Answered` and the selected/custom response, with quick-reply buttons removed. Idle notifications that were already sent are edited to show that the session resumed. Coordination state is shared through a token-hashed temp directory with a single polling lock, so separate Pi sessions using the same bot/chat do not race each other with competing `getUpdates` offsets. If either setting is missing, Telegram integration is disabled and the local Pi UI continues to work normally. Tokens are only read from the settings file and are not printed in warnings.
 
@@ -174,6 +219,9 @@ interface AskToolDetails {
   options: QuestionOption[];
   response: AskResponse | null;
   cancelled: boolean;
+  timedOut?: boolean;
+  presenceMode?: "normal" | "away";
+  timeoutMs?: number;
 }
 ```
 

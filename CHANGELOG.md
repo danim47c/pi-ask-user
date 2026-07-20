@@ -5,8 +5,15 @@
 ### Added
 
 - Local Pi notifications when an `ask_user` prompt opens.
+- Herdr blocked-state reporting while an `ask_user` prompt is awaiting input, cleared reliably on answers, cancellation, timeout, or tool failure.
+- Cross-session `ask_user` availability policy with a 10-minute normal timeout, automatic one-minute away timeout after the first expiry, human-activity reset, `/ask-status`, `/ask-away`, and `/ask-reset` commands, adaptive Telegram delivery, and goal-safe timeout guidance.
 - Optional Telegram notifications configured in `~/.pi/agent/settings.json` under top-level `telegram.botToken` and `telegram.chatId`; ask prompts are delayed by 60 seconds, suppressed when answered locally before then, include the full prompt, hidden request IDs in callback data, A/B/C-style quick-reply buttons, custom-answer prompts, selection comments in reply text, reply-to-message handling, answer-state message edits, and request correlation for simultaneous prompts across independent Pi sessions via shared token-hashed temp state and a single polling lock.
 - Telegram notifications when the Pi agent reaches `agent_end`/idle, also delayed by 60 seconds, suppressed if the user responds before then, and edited as resumed if already sent.
+- Compact rich Telegram messages with escaped HTML/details blocks and automatic private-chat forum topics named for the repository or linked worktree; topic use falls back safely to the general chat.
+
+### Fixed
+
+- Idle Telegram notifications now wait until all async subagent runs complete, reconcile active runs after extension reloads or missed start events, and are disabled entirely inside subagent child processes.
 
 ## [0.11.1](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.11.1) - 2026-05-23
 
@@ -74,7 +81,6 @@
 - `ask_user` result details and emitted `ask:answered` events now use a structured `response` union instead of flattening everything into `answer` / `wasCustom`
 - Expanded result rendering now shows selection comments separately from chosen options
 
-
 ## [0.5.2](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.5.2) - 2026-04-06
 
 ### Fixed
@@ -104,7 +110,6 @@
 - Overlay freeform answers now preserve `wasCustom: true` in both emitted events and returned `details` metadata
 - Out-of-range number keys in searchable single-select now fall through to filtering instead of being silently swallowed
 - Exact-width word wrapping no longer duplicates preceding short text in wrapped descriptions
-
 
 ## [0.4.1](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.4.1) - 2026-03-22
 
