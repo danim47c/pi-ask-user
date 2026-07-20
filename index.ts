@@ -204,6 +204,7 @@ interface TelegramUpdate {
 		message_id: number;
 		message_thread_id?: number;
 		chat?: { id?: string | number };
+		from?: { is_bot?: boolean };
 		text?: string;
 		reply_to_message?: { message_id?: number };
 	};
@@ -242,6 +243,8 @@ interface TelegramSharedStore {
 	offsetFile: string;
 	topicFile: string;
 	topicLockDir: string;
+	registrationsDir: string;
+	inboxDir: string;
 }
 
 interface TelegramPollLock {
@@ -455,6 +458,8 @@ function createTelegramSharedStore(
 		offsetFile: join(rootDir, "offset.json"),
 		topicFile: join(rootDir, "topics.json"),
 		topicLockDir: join(rootDir, "topics.lock"),
+		registrationsDir: join(rootDir, "registrations"),
+		inboxDir: join(rootDir, "inbox"),
 	};
 }
 
@@ -532,21 +537,12 @@ function buildBoundedTelegramHtml(parts: TelegramHtmlPart[], maxLength = TELEGRA
 	return truncated ? `${output}…` : output;
 }
 
-async function resolveTelegramTopicName(): Promise<string | null> {
+async function resolveTelegramTopicName(sessionId: string, sessionName?: string, cwd = process.cwd()): Promise<string | null> {
 	try {
-		const cwd = process.cwd();
-		const [{ stdout: rootOut }, { stdout: topOut }] = await Promise.all([
-			execFileAsync("git", ["-C", cwd, "rev-parse", "--show-toplevel"]),
-			execFileAsync("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"]),
-		]);
-		const root = rootOut.trim();
-		const common = topOut.trim();
-		if (!root || !common) return null;
-		// In a linked checkout common is <main>/.git, not the worktree's .git file.
-		const mainRoot = common.endsWith("/.git") ? common.slice(0, -5) : root;
-		const repository = mainRoot.split("/").filter(Boolean).pop() || "repository";
-		const isMain = common === join(root, ".git");
-		return isMain ? repository : `${repository} · ${root.split("/").filter(Boolean).pop() || "worktree"}`;
+		const { stdout } = await execFileAsync("git", ["-C", cwd, "rev-parse", "--show-toplevel"]);
+		const repository = basename(stdout.trim()) || "repository";
+		const name = sessionName?.trim() || sessionId.slice(0, 8);
+		return truncatePlainText(`${repository} · ${name}`, 128);
 	} catch {
 		return null;
 	}
@@ -1143,7 +1139,36 @@ async function tryAcquireTelegramPollLock(store: TelegramSharedStore): Promise<T
 	return await tryAcquireTelegramLease(store.lockDir, TELEGRAM_LOCK_STALE_MS);
 }
 
-interface TelegramTopicMap { topics: Record<string, number> }
+interface TelegramTopicBinding { threadId: number; title: string; createdAt: number }
+interface TelegramTopicMap { version?: number; topics: Record<string, number | TelegramTopicBinding>; threads?: Record<string, string> }
+interface TelegramSessionRegistration { sessionId: string; instanceId: string; pid: number; heartbeatAt: number; title: string; threadId?: number }
+interface TelegramInboxEnvelope { updateId: number; text: string; messageId: number; threadId: number; createdAt: number }
+
+function topicBinding(map: TelegramTopicMap, sessionId: string): TelegramTopicBinding | undefined {
+	const value = map.topics[sessionId];
+	return typeof value === "number" ? undefined : value;
+}
+function registrationPath(store: TelegramSharedStore, sessionId: string): string { return join(store.registrationsDir, `${createHash("sha256").update(sessionId).digest("hex")}.json`); }
+function inboxPath(store: TelegramSharedStore, instanceId: string, updateId: number): string { return join(store.inboxDir, instanceId, `${updateId}.json`); }
+async function listLiveRegistrations(store: TelegramSharedStore): Promise<TelegramSessionRegistration[]> {
+	await mkdir(store.registrationsDir, { recursive: true, mode: 0o700 });
+	const entries = await readdir(store.registrationsDir);
+	const now = Date.now();
+	const result: TelegramSessionRegistration[] = [];
+	for (const entry of entries) {
+		const registration = await readJsonFile<TelegramSessionRegistration>(join(store.registrationsDir, entry));
+		if (!registration) continue;
+		if (now - registration.heartbeatAt > TELEGRAM_LOCK_STALE_MS) { await rm(join(store.registrationsDir, entry), { force: true }); continue; }
+		result.push(registration);
+	}
+	return result;
+}
+async function enqueueTelegramInbox(store: TelegramSharedStore, instanceId: string, envelope: TelegramInboxEnvelope): Promise<boolean> {
+	const path = inboxPath(store, instanceId, envelope.updateId);
+	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+	try { await writeFile(path, `${JSON.stringify(envelope)}\n`, { flag: "wx", mode: 0o600 }); return true; }
+	catch (error) { if (isErrno(error, "EEXIST")) return false; throw error; }
+}
 
 async function withTelegramTopicLock<T>(store: TelegramSharedStore, operation: () => Promise<T>): Promise<T> {
 	await ensureTelegramStoreDirs(store);
@@ -1186,6 +1211,9 @@ class TelegramBotPoller {
 	private readonly config: TelegramConfig;
 	private readonly store: TelegramSharedStore;
 	private topicId: number | null | undefined;
+	private routing: { sessionId: string; sessionName?: string; cwd: string } | undefined;
+	private localSession: { sessionId: string; instanceId: string; deliver: (text: string) => Promise<"idle" | "followUp"> } | undefined;
+	private registrationTimer: ReturnType<typeof setInterval> | undefined;
 	private abortController: AbortController | undefined;
 	private loopPromise: Promise<void> | undefined;
 	private ensurePromise: Promise<void> | undefined;
@@ -1193,6 +1221,56 @@ class TelegramBotPoller {
 	constructor(config: TelegramConfig) {
 		this.config = config;
 		this.store = createTelegramSharedStore(config);
+	}
+
+	setRouting(routing: { sessionId: string; sessionName?: string; cwd: string }): void { this.routing = routing; }
+
+	async activateSession(routing: { sessionId: string; sessionName?: string; cwd: string }, deliver: (text: string) => Promise<"idle" | "followUp">): Promise<void> {
+		this.setRouting(routing);
+		const instanceId = telegramLeaseToken();
+		const register = async () => {
+			await withTelegramTopicLock(this.store, async () => {
+				const path = registrationPath(this.store, routing.sessionId);
+				const existing = await readJsonFile<TelegramSessionRegistration>(path);
+				if (existing && Date.now() - existing.heartbeatAt <= TELEGRAM_LOCK_STALE_MS && existing.instanceId !== instanceId) return;
+				const map = await readJsonFile<TelegramTopicMap>(this.store.topicFile);
+				const binding = map && topicBinding(map, routing.sessionId);
+				await mkdir(this.store.registrationsDir, { recursive: true, mode: 0o700 });
+				await writeJsonFileAtomic(path, { sessionId: routing.sessionId, instanceId, pid: process.pid, heartbeatAt: Date.now(), title: routing.sessionName || routing.sessionId.slice(0, 8), ...(binding ? { threadId: binding.threadId } : {}) });
+				this.localSession = { sessionId: routing.sessionId, instanceId, deliver };
+			});
+		};
+		await register();
+		this.registrationTimer = setInterval(() => { void register().then(() => this.consumeInbox()).then(() => this.ensurePolling()); }, 5_000);
+		await this.consumeInbox();
+		void this.ensurePolling();
+	}
+
+	async deactivateSession(): Promise<void> {
+		if (this.registrationTimer) clearInterval(this.registrationTimer);
+		this.registrationTimer = undefined;
+		const local = this.localSession; this.localSession = undefined;
+		if (!local) return;
+		await withTelegramTopicLock(this.store, async () => {
+			const path = registrationPath(this.store, local.sessionId);
+			const current = await readJsonFile<TelegramSessionRegistration>(path);
+			if (current?.instanceId === local.instanceId) await rm(path, { force: true });
+		});
+	}
+
+	private async consumeInbox(): Promise<void> {
+		const local = this.localSession; if (!local) return;
+		const dir = join(this.store.inboxDir, local.instanceId);
+		let entries: string[]; try { entries = await readdir(dir); } catch (error) { if (isErrno(error, "ENOENT")) return; throw error; }
+		for (const entry of entries.filter((name) => name.endsWith(".json"))) {
+			const path = join(dir, entry); const claimed = `${path}.claimed`; const done = `${path}.done`;
+			try { await rename(path, claimed); } catch (error) { if (isErrno(error, "ENOENT")) continue; throw error; }
+			const envelope = await readJsonFile<TelegramInboxEnvelope>(claimed); if (!envelope) { await rm(claimed, { force: true }); continue; }
+			// Publishing completion before injection deliberately favors at-most-once delivery after a crash.
+			await rename(claimed, done);
+			try { const status = await local.deliver(envelope.text); await this.safeCallApi("setMessageReaction", { chat_id: this.config.chatId, message_id: envelope.messageId, reaction: [{ type: "emoji", emoji: status === "idle" ? "✅" : "⏳" }] }); }
+			catch { await this.safeCallApi("sendMessage", { chat_id: this.config.chatId, message_thread_id: envelope.threadId, reply_to_message_id: envelope.messageId, text: "Unable to deliver this message to Pi." }); }
+		}
 	}
 
 	async createPendingAsk(record: SharedTelegramAskRecord): Promise<void> {
@@ -1239,16 +1317,23 @@ class TelegramBotPoller {
 		try {
 			const me = await this.callApi<{ has_topics_enabled?: boolean }>("getMe", {});
 			if (!me.has_topics_enabled) return undefined;
-			const name = await resolveTelegramTopicName();
+			const routing = this.routing;
+			if (!routing) return undefined;
+			const name = await resolveTelegramTopicName(routing.sessionId, routing.sessionName, routing.cwd);
 			if (!name) return undefined;
-			const key = createHash("sha256").update(name).digest("hex");
 			this.topicId = await withTelegramTopicLock(this.store, async () => {
-				const map = (await readJsonFile<TelegramTopicMap>(this.store.topicFile)) ?? { topics: {} };
-				const existing = map.topics[key];
-				if (existing) return existing;
-				const topic = await this.callApi<{ message_thread_id: number }>("createForumTopic", { chat_id: this.config.chatId, name: truncatePlainText(name, 128) });
-				map.topics[key] = topic.message_thread_id;
+				const map = (await readJsonFile<TelegramTopicMap>(this.store.topicFile)) ?? { version: 2, topics: {}, threads: {} };
+				const existing = topicBinding(map, routing.sessionId);
+				if (existing) return existing.threadId;
+				const topic = await this.callApi<{ message_thread_id: number }>("createForumTopic", { chat_id: this.config.chatId, name });
+				map.version = 2; map.topics[routing.sessionId] = { threadId: topic.message_thread_id, title: name, createdAt: Date.now() };
+				map.threads ??= {}; map.threads[String(topic.message_thread_id)] = routing.sessionId;
 				await writeJsonFileAtomic(this.store.topicFile, map);
+				if (this.localSession?.sessionId === routing.sessionId) {
+					const path = registrationPath(this.store, routing.sessionId);
+					const registration = await readJsonFile<TelegramSessionRegistration>(path);
+					if (registration?.instanceId === this.localSession.instanceId) await writeJsonFileAtomic(path, { ...registration, threadId: topic.message_thread_id, heartbeatAt: Date.now() });
+				}
 				return topic.message_thread_id;
 			});
 		} catch { this.topicId = null; }
@@ -1257,11 +1342,13 @@ class TelegramBotPoller {
 
 	private async invalidateTopic(rejectedThreadId: number): Promise<void> {
 		this.topicId = undefined;
-		const name = await resolveTelegramTopicName();
-		if (!name) return;
-		const key = createHash("sha256").update(name).digest("hex");
+		const routing = this.routing;
+		if (!routing) return;
 		await withTelegramTopicLock(this.store, async () => {
-			await invalidateTelegramTopicMap(this.store.topicFile, key, rejectedThreadId);
+			const map = await readJsonFile<TelegramTopicMap>(this.store.topicFile);
+			if (!map || topicBinding(map, routing.sessionId)?.threadId !== rejectedThreadId) return;
+			delete map.topics[routing.sessionId]; delete map.threads?.[String(rejectedThreadId)];
+			await writeJsonFileAtomic(this.store.topicFile, map);
 		});
 	}
 
@@ -1334,7 +1421,7 @@ class TelegramBotPoller {
 			while (!signal.aborted) {
 				await lock.refresh();
 
-				if (!(await sharedStoreHasPendingAsks(this.store))) {
+						if (!(await sharedStoreHasPendingAsks(this.store)) && (await listLiveRegistrations(this.store)).length === 0) {
 					return;
 				}
 
@@ -1369,7 +1456,7 @@ class TelegramBotPoller {
 			await this.handleCallbackQuery(update.callback_query);
 		}
 		if (update.message) {
-			await this.handleMessage(update.message);
+			await this.handleMessage(update.update_id, update.message);
 		}
 	}
 
@@ -1437,27 +1524,38 @@ class TelegramBotPoller {
 	}
 
 	private async handleMessage(
+		updateId: number,
 		message: NonNullable<TelegramUpdate["message"]>,
 	): Promise<void> {
-		if (!telegramChatMatches(message.chat, this.config)) return;
+		if (!telegramChatMatches(message.chat, this.config) || message.from?.is_bot) return;
 		const replyToMessageId = message.reply_to_message?.message_id;
-		if (replyToMessageId === undefined) return;
-
 		const records = await listSharedAsks(this.store);
-		const record = records.find(
-			(candidate) =>
-				candidate.status === "pending" && candidate.messageId === replyToMessageId &&
+		const record = replyToMessageId === undefined ? undefined : records.find(
+			(candidate) => candidate.status === "pending" && candidate.messageId === replyToMessageId &&
 				(candidate.messageThreadId === undefined || candidate.messageThreadId === message.message_thread_id),
 		);
-		if (!record || !message.text) return;
-
-		const response = parseTelegramTextResponse(message.text, record.request);
-		if (!response) {
-			await this.safeCallApi("sendMessage", { chat_id: this.config.chatId, reply_to_message_id: message.message_id, ...(record.messageThreadId !== undefined ? { message_thread_id: record.messageThreadId } : {}), text: "I could not match that reply to an available ask_user answer. Try an option button, letter, or title.", parse_mode: "HTML" });
+		// A pending ask owns its reply semantics; only non-ask replies fall through.
+		if (record) {
+			if (!message.text) return;
+			const response = parseTelegramTextResponse(message.text, record.request);
+			if (!response) {
+				await this.safeCallApi("sendMessage", { chat_id: this.config.chatId, reply_to_message_id: message.message_id, ...(record.messageThreadId !== undefined ? { message_thread_id: record.messageThreadId } : {}), text: "I could not match that reply to an available ask_user answer. Try an option button, letter, or title." });
+				return;
+			}
+			await this.answerSharedAsk(record, response);
 			return;
 		}
-
-		await this.answerSharedAsk(record, response);
+		if (typeof message.text !== "string" || message.message_thread_id === undefined) return;
+		const map = await readJsonFile<TelegramTopicMap>(this.store.topicFile);
+		const sessionId = map?.threads?.[String(message.message_thread_id)];
+		if (!sessionId) return;
+		const registration = (await listLiveRegistrations(this.store)).find((item) => item.sessionId === sessionId && item.threadId === message.message_thread_id);
+		if (!registration) {
+			await this.safeCallApi("sendMessage", { chat_id: this.config.chatId, message_thread_id: message.message_thread_id, reply_to_message_id: message.message_id, text: "⚪ This Pi session is no longer active." });
+			return;
+		}
+		await this.safeCallApi("setMessageReaction", { chat_id: this.config.chatId, message_id: message.message_id, reaction: [{ type: "emoji", emoji: "👀" }] });
+		await enqueueTelegramInbox(this.store, registration.instanceId, { updateId, text: message.text, messageId: message.message_id, threadId: message.message_thread_id, createdAt: Date.now() });
 	}
 
 	private async answerSharedAsk(
@@ -1696,6 +1794,22 @@ interface TelegramSentNotificationHandle {
 
 class TelegramNotifyManager {
 	private pollers = new Map<string, TelegramBotPoller>();
+
+	async activateSession(pi: ExtensionAPI, ctx: { sessionManager: { getSessionId: () => string; getSessionName: () => string | undefined }; cwd: string; isIdle: () => boolean }): Promise<void> {
+		if (process.env.PI_SUBAGENT_CHILD === "1") return;
+		const config = await resolveTelegramConfig(); if (!config) return;
+		const sessionId = ctx.sessionManager.getSessionId(); if (!sessionId) return;
+		const poller = this.getPoller(config);
+		await poller.activateSession({ sessionId, sessionName: ctx.sessionManager.getSessionName(), cwd: ctx.cwd }, async (text) => {
+			const idle = ctx.isIdle();
+			await pi.sendUserMessage(text, idle ? undefined : { deliverAs: "followUp" });
+			return idle ? "idle" : "followUp";
+		});
+	}
+
+	async deactivateSession(): Promise<void> {
+		await Promise.all([...this.pollers.values()].map((poller) => poller.deactivateSession()));
+	}
 
 	async openAsk(
 		request: AskNotificationRequest,
@@ -3580,6 +3694,9 @@ export default function (pi: ExtensionAPI) {
 		scheduleAgentEndTelegramNotice(deferred.event, deferred.ctx);
 	});
 
+	pi.on("session_start", async (_event, ctx) => {
+		await telegramNotifyManager.activateSession(pi, ctx);
+	});
 	pi.on("input", async (event) => {
 		if (event.source !== "extension") {
 			await recordHumanActivity().catch(() => undefined);
@@ -3612,6 +3729,7 @@ export default function (pi: ExtensionAPI) {
 		scheduleAgentEndTelegramNotice(event, ctx);
 	});
 	pi.on("session_shutdown", async () => {
+		await telegramNotifyManager.deactivateSession();
 		deferredAgentEnd = undefined;
 		activeAsyncRunIds.clear();
 		cancelPendingAgentEndTelegramNotice();

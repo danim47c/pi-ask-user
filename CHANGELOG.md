@@ -9,7 +9,8 @@
 - Cross-session `ask_user` availability policy with a 10-minute normal timeout, automatic one-minute away timeout after the first expiry, human-activity reset, `/ask-status`, `/ask-away`, and `/ask-reset` commands, adaptive Telegram delivery, and goal-safe timeout guidance.
 - Optional Telegram notifications configured in `~/.pi/agent/settings.json` under top-level `telegram.botToken` and `telegram.chatId`; ask prompts are delayed by 60 seconds, suppressed when answered locally before then, include the full prompt, hidden request IDs in callback data, A/B/C-style quick-reply buttons, custom-answer prompts, selection comments in reply text, reply-to-message handling, answer-state message edits, and request correlation for simultaneous prompts across independent Pi sessions via shared token-hashed temp state and a single polling lock.
 - Telegram notifications when the Pi agent reaches `agent_end`/idle, also delayed by 60 seconds, suppressed if the user responds before then, and edited as resumed if already sent.
-- Compact rich Telegram messages with escaped HTML/details blocks and automatic private-chat forum topics named for the repository or linked worktree; topic use falls back safely to the general chat.
+- Compact rich Telegram messages with escaped HTML/details blocks and automatic private-chat forum topics; topic use falls back safely to the general chat.
+- Per-session Telegram topics (`repository · session-name` or short session ID), durable cross-process routing of free text, idle/follow-up delivery, inactive historical-topic notices, and safe migration that leaves legacy repository/worktree topics untouched. Topic routing is text-only and requires Telegram private-chat forum topics.
 
 ### Fixed
 

@@ -956,10 +956,10 @@ describe("ask_user", () => {
 			const lease = await hooks();
 			const config = { botToken: "rejected-topic-send-test", chatId: "4242", apiBaseUrl: "https://telegram.test" };
 			const store = lease.storeForConfig(config);
-			const key = createHash("sha256").update("pi-ask-user").digest("hex");
+			const key = "test-session";
 			rmSync(store.rootDir, { recursive: true, force: true });
 			mkdirSync(store.rootDir, { recursive: true });
-			writeFileSync(store.topicFile, JSON.stringify({ topics: { [key]: 41 } }));
+			writeFileSync(store.topicFile, JSON.stringify({ version: 2, topics: { [key]: { threadId: 41, title: "pi-ask-user · test", createdAt: 0 } }, threads: { "41": key } }));
 			const calls: Array<{ method: string; body: any }> = [];
 			stubFetch((url, init) => {
 				const method = url.split("/").pop()!;
@@ -972,10 +972,11 @@ describe("ask_user", () => {
 				if (method === "sendRichMessage") return telegramOk({ message_id: 7 });
 				return telegramOk({});
 			});
-			await lease.createPoller(config).sendNotificationMessage("hello");
+			const poller = lease.createPoller(config); poller.setRouting({ sessionId: key, sessionName: "test", cwd: process.cwd() });
+			await poller.sendNotificationMessage("hello");
 			expect(calls.filter((call) => call.method === "createForumTopic")).toHaveLength(1);
 			expect(calls.filter((call) => call.method === "sendRichMessage").map((call) => call.body.message_thread_id)).toEqual([41, 42]);
-			expect(readFileSync(store.topicFile, "utf8")).toBe(`${JSON.stringify({ topics: { [key]: 42 } })}\n`);
+			expect(readFileSync(store.topicFile, "utf8")).toContain('"threadId":42');
 		});
 
 		test("Telegram send retries only explicit missing-topic errors and preserves newer mappings", async () => {
@@ -991,23 +992,23 @@ describe("ask_user", () => {
 				if (method === "getMe") return telegramOk({ has_topics_enabled: true });
 				if (method === "createForumTopic") return telegramOk({ message_thread_id: topic++ });
 				if (method === "sendRichMessage" && body.message_thread_id === 11) {
-					const key = createHash("sha256").update("pi-ask-user").digest("hex");
-					writeFileSync(store.topicFile, JSON.stringify({ topics: { [key]: 99 } }));
+					const key = "test-session";
+					writeFileSync(store.topicFile, JSON.stringify({ version: 2, topics: { [key]: { threadId: 99, title: "test", createdAt: 0 } }, threads: { "99": key } }));
 					return new Response(JSON.stringify({ ok: false, description: "Bad Request: message thread was not found" }), { status: 400 });
 				}
 				if (method === "sendRichMessage") return telegramOk({ message_id: 7 });
 				return telegramOk({});
 			});
-			const poller = lease.createPoller(config);
+			const poller = lease.createPoller(config); const key = "test-session";
+			poller.setRouting({ sessionId: key, sessionName: "test", cwd: process.cwd() });
 			await poller.sendNotificationMessage("hello");
 			expect(calls.filter((call) => call.method === "sendRichMessage").map((call) => call.body.message_thread_id)).toEqual([11, 99]);
-			const key = createHash("sha256").update("pi-ask-user").digest("hex");
-			expect(readFileSync(store.topicFile, "utf8")).toContain(`"${key}":99`);
+			expect(readFileSync(store.topicFile, "utf8")).toContain('"threadId":99');
 			calls.length = 0;
 			const genericConfig = { ...config, botToken: "generic-send-test" };
 			const genericStore = lease.storeForConfig(genericConfig);
 			mkdirSync(genericStore.rootDir, { recursive: true });
-			writeFileSync(genericStore.topicFile, JSON.stringify({ topics: { [key]: 33 } }));
+			writeFileSync(genericStore.topicFile, JSON.stringify({ version: 2, topics: { [key]: { threadId: 33, title: "test", createdAt: 0 } }, threads: { "33": key } }));
 			stubFetch((url, init) => {
 				const method = url.split("/").pop()!; calls.push({ method, body: jsonBody(init) });
 				if (method === "getMe") return telegramOk({ has_topics_enabled: true });
@@ -1015,7 +1016,8 @@ describe("ask_user", () => {
 				if (method === "sendRichMessage") return new Response(JSON.stringify({ ok: false, description: "Bad Request: message thread rejected" }), { status: 400 });
 				return telegramOk({});
 			});
-			await expect(lease.createPoller(genericConfig).sendNotificationMessage("hello")).rejects.toThrow("message thread rejected");
+			const genericPoller = lease.createPoller(genericConfig); genericPoller.setRouting({ sessionId: key, sessionName: "test", cwd: process.cwd() });
+			await expect(genericPoller.sendNotificationMessage("hello")).rejects.toThrow("message thread rejected");
 			expect(calls.filter((call) => call.method === "sendRichMessage")).toHaveLength(1);
 			expect(calls.filter((call) => call.method === "createForumTopic")).toHaveLength(0);
 		});
