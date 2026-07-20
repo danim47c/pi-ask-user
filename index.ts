@@ -484,8 +484,14 @@ function escapeTelegramHtml(text: string): string {
 	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function telegramHtml(text: string): string {
-	return escapeTelegramHtml(truncatePlainText(text, TELEGRAM_MAX_MESSAGE_LENGTH));
+function telegramHtml(text: string, maxLength = TELEGRAM_MAX_MESSAGE_LENGTH): string {
+	let output = "";
+	for (const character of text) {
+		const escaped = escapeTelegramHtml(character);
+		if (output.length + escaped.length > maxLength) break;
+		output += escaped;
+	}
+	return output.length < text.length ? `${output.slice(0, Math.max(0, maxLength - 1))}…` : output;
 }
 
 async function resolveTelegramTopicName(): Promise<string | null> {
@@ -498,9 +504,9 @@ async function resolveTelegramTopicName(): Promise<string | null> {
 		const root = rootOut.trim();
 		const common = topOut.trim();
 		if (!root || !common) return null;
-		const repository = root.split("/").filter(Boolean).pop() || "repository";
-		// A linked worktree has its own .git file while the main checkout's git dir
-		// is the common directory itself.
+		// In a linked checkout common is <main>/.git, not the worktree's .git file.
+		const mainRoot = common.endsWith("/.git") ? common.slice(0, -5) : root;
+		const repository = mainRoot.split("/").filter(Boolean).pop() || "repository";
 		const isMain = common === join(root, ".git");
 		return isMain ? repository : `${repository} · ${root.split("/").filter(Boolean).pop() || "worktree"}`;
 	} catch {
@@ -657,18 +663,26 @@ function buildTelegramInlineKeyboard(
 	return { inline_keyboard: rows };
 }
 
-function buildTelegramAskMessage(
-	requestId: string,
-	request: AskNotificationRequest,
-): string {
+interface TelegramRenderedMessage { rich: string; regular: string }
+
+/** Build bounded, balanced HTML once; dynamic values are escaped before truncation. */
+function renderTelegramAskMessage(request: AskNotificationRequest): TelegramRenderedMessage {
+	const choices = request.options.slice(0, 6).map((option, index) =>
+		`${telegramOptionLabel(index)}. ${telegramHtml(option.title, 90)}${option.description ? ` — ${telegramHtml(option.description, 90)}` : ""}`).join("\n");
+	const question = telegramHtml(request.question, 400);
+	const context = request.context ? telegramHtml(request.context, 400) : "";
+	const details = [context, choices].filter(Boolean).join("\n\n");
+	const core = ["🔔 <b>ask_user</b>", `<b>Question</b> ${question}`,
+		choices ? `<b>Choices</b>\n${choices}` : "<i>Freeform answer requested</i>",
+		"<i>Use a button or reply to this message.</i>"].join("\n\n");
+	const regular = [core, details ? `<b>Details</b>\n${details}` : ""].filter(Boolean).join("\n\n");
+	const rich = [core, details ? `<details><summary>Details</summary>${details}</details>` : ""].filter(Boolean).join("\n\n");
+	return { rich, regular };
+}
+
+function buildTelegramAskMessage(requestId: string, request: AskNotificationRequest): string {
 	void requestId;
-	const options = request.options.slice(0, 6).map((option, index) =>
-		`${telegramOptionLabel(index)}. ${option.title}`).join("\n");
-	return ["🔔 <b>ask_user</b>", `<b>Question</b> ${telegramHtml(request.question)}`,
-		request.options.length ? `<b>Choices</b>\n${telegramHtml(options)}` : "<i>Freeform answer requested</i>",
-		"<i>Use a button or reply to this message.</i>",
-		`<details><summary>Details</summary>${telegramHtml([request.context, request.options.map((option, index) => `${telegramOptionLabel(index)}. ${option.title}${option.description ? ` — ${option.description}` : ""}`).join("\n")].filter(Boolean).join("\n\n"))}</details>`]
-		.filter(Boolean).join("\n\n");
+	return renderTelegramAskMessage(request).rich;
 }
 
 function buildTelegramAnsweredMessage(record: SharedTelegramAskRecord, response: AskResponse): string {
@@ -1020,17 +1034,44 @@ async function tryAcquireTelegramPollLock(
 interface TelegramTopicMap { topics: Record<string, number> }
 
 async function withTelegramTopicLock<T>(store: TelegramSharedStore, operation: () => Promise<T>): Promise<T> {
+	await ensureTelegramStoreDirs(store); // also creates root before an idle-first lock
+	const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+	const ownerFile = join(store.topicLockDir, "owner.json");
 	const deadline = Date.now() + 5_000;
 	while (true) {
 		try { await mkdir(store.topicLockDir, { mode: 0o700 }); break; } catch (error) {
 			if (!isErrno(error, "EEXIST")) throw error;
-			const info = await stat(store.topicLockDir).catch(() => null);
-			if (info && Date.now() - info.mtimeMs > 10_000) { await rm(store.topicLockDir, { recursive: true, force: true }); continue; }
+			const owner = await readJsonFile<{ token?: string; heartbeatAt?: number }>(ownerFile);
+			if ((owner?.heartbeatAt ?? 0) + 10_000 < Date.now()) {
+				// Only reclaim the owner we inspected; a live owner refreshes its token.
+				const current = await readJsonFile<{ token?: string }>(ownerFile);
+				if (current?.token === owner?.token) await rm(store.topicLockDir, { recursive: true, force: true });
+				continue;
+			}
 			if (Date.now() >= deadline) throw new Error("Timed out locking Telegram topic state");
 			await delay(25);
 		}
 	}
-	try { return await operation(); } finally { await rm(store.topicLockDir, { recursive: true, force: true }); }
+	const refresh = async () => await writeJsonFileAtomic(ownerFile, { token, heartbeatAt: Date.now() });
+	await refresh();
+	const heartbeat = setInterval(() => { void refresh(); }, 2_000);
+	try { return await operation(); } finally {
+		clearInterval(heartbeat);
+		const owner = await readJsonFile<{ token?: string }>(ownerFile);
+		if (owner?.token === token) await rm(store.topicLockDir, { recursive: true, force: true });
+	}
+}
+
+class TelegramApiError extends Error {
+	constructor(readonly status: number, readonly description: string) { super(description); }
+}
+
+function isRichMessageUnsupported(error: unknown): boolean {
+	return error instanceof TelegramApiError && /rich_message|rich message|unsupported|can't parse entities|parse entities/i.test(error.description);
+}
+
+function isInvalidTopic(error: unknown): boolean {
+	return error instanceof TelegramApiError && /message thread|topic.*(?:not found|invalid)|thread.*(?:not found|invalid)/i.test(error.description);
 }
 
 class TelegramBotPoller {
@@ -1108,31 +1149,51 @@ class TelegramBotPoller {
 
 	private async invalidateTopic(): Promise<void> {
 		this.topicId = undefined;
-		await withTelegramTopicLock(this.store, async () => { await rm(this.store.topicFile, { force: true }); });
+		const name = await resolveTelegramTopicName();
+		if (!name) return;
+		const key = createHash("sha256").update(name).digest("hex");
+		await withTelegramTopicLock(this.store, async () => {
+			const map = await readJsonFile<TelegramTopicMap>(this.store.topicFile);
+			if (!map?.topics[key]) return;
+			delete map.topics[key];
+			await writeJsonFileAtomic(this.store.topicFile, map);
+		});
 	}
 
 	async sendNotificationMessage(text: string, replyMarkup?: Record<string, unknown>): Promise<TelegramMessage> {
 		const controller = new AbortController();
 		const timeout = setTimeout(() => controller.abort(), TELEGRAM_SEND_TIMEOUT_MS);
+		const regularText = text.replace(/<details><summary>Details<\/summary>([\s\S]*?)<\/details>/g, "<b>Details</b>\n$1");
 		const send = async (threadId?: number): Promise<TelegramMessage> => {
-			const body = { chat_id: this.config.chatId, rich_message: { type: "html", html: text }, disable_web_page_preview: true, ...(threadId !== undefined ? { message_thread_id: threadId } : {}), ...(replyMarkup ? { reply_markup: replyMarkup } : {}) };
+			const routing = { chat_id: this.config.chatId, disable_web_page_preview: true, ...(threadId !== undefined ? { message_thread_id: threadId } : {}), ...(replyMarkup ? { reply_markup: replyMarkup } : {}) };
 			try {
-				const message = await this.callApi<TelegramMessage>("sendRichMessage", body, controller.signal);
+				const message = await this.callApi<TelegramMessage>("sendRichMessage", { ...routing, rich_message: { type: "html", html: text } }, controller.signal);
 				if (typeof message?.message_id !== "number") throw new Error("sendRichMessage returned no message id");
 				return message;
-			} catch { return await this.callApi<TelegramMessage>("sendMessage", { ...body, text: truncatePlainText(text.replace(/<[^>]*>/g, ""), TELEGRAM_MAX_MESSAGE_LENGTH), parse_mode: "HTML" }, controller.signal); }
+			} catch (error) {
+				if (!isRichMessageUnsupported(error)) throw error;
+				return await this.callApi<TelegramMessage>("sendMessage", { ...routing, text: regularText, parse_mode: "HTML" }, controller.signal);
+			}
 		};
 		try {
 			const threadId = await this.getMessageThreadId();
 			try { return await send(threadId); }
-			catch (error) { if (threadId === undefined) throw error; await this.invalidateTopic(); try { return await send(await this.getMessageThreadId()); } catch { return await send(); } }
+			catch (error) {
+				if (threadId === undefined || !isInvalidTopic(error)) throw error;
+				await this.invalidateTopic();
+				return await send(await this.getMessageThreadId());
+			}
 		} finally { clearTimeout(timeout); }
 	}
 
 	async editNotificationMessage(messageId: number, text: string, replyMarkup?: Record<string, unknown>, messageThreadId?: number): Promise<void> {
-		const body = { chat_id: this.config.chatId, message_id: messageId, rich_message: { type: "html", html: text }, text: truncatePlainText(text.replace(/<[^>]*>/g, ""), TELEGRAM_MAX_MESSAGE_LENGTH), parse_mode: "HTML", ...(messageThreadId !== undefined ? { message_thread_id: messageThreadId } : {}), ...(replyMarkup ? { reply_markup: replyMarkup } : {}) };
-		try { await this.callApi("editMessageText", body); }
-		catch { await this.safeCallApi("editMessageText", { ...body, text: truncatePlainText(text.replace(/<[^>]*>/g, ""), TELEGRAM_MAX_MESSAGE_LENGTH), parse_mode: "HTML" }); }
+		const routing = { chat_id: this.config.chatId, message_id: messageId, ...(messageThreadId !== undefined ? { message_thread_id: messageThreadId } : {}), ...(replyMarkup ? { reply_markup: replyMarkup } : {}) };
+		try { await this.callApi("editMessageText", { ...routing, rich_message: { type: "html", html: text } }); }
+		catch (error) {
+			if (!isRichMessageUnsupported(error)) throw error;
+			const regularText = text.replace(/<details><summary>Details<\/summary>([\s\S]*?)<\/details>/g, "<b>Details</b>\n$1");
+			await this.callApi("editMessageText", { ...routing, text: regularText, parse_mode: "HTML" });
+		}
 	}
 
 	async ensurePolling(): Promise<void> {
@@ -1346,9 +1407,9 @@ class TelegramBotPoller {
 			catch { throw new Error(`Telegram ${method} returned invalid JSON`); }
 		}
 		if (!response.ok || payload.ok !== true) {
-			throw new Error(
-				payload.description ||
-					`Telegram ${method} failed with HTTP ${response.status}`,
+			throw new TelegramApiError(
+				response.status,
+				payload.description || `Telegram ${method} failed with HTTP ${response.status}`,
 			);
 		}
 		return payload.result as T;
@@ -1725,8 +1786,8 @@ function buildAgentEndTelegramMessage(event: unknown, ctx: unknown): string {
 	const model = context.model?.name || context.model?.id;
 	const session = safeCall(() => context.sessionManager?.getSessionId?.());
 	const lastResponse = extractLastAssistantText(event);
-	return ["🔔 <b>Pi agent idle</b>", project ? `<b>Project</b> ${telegramHtml(project)}` : "", "Finished and waiting for your next input.",
-		`<details><summary>Details</summary>${telegramHtml([model ? `Model: ${context.model?.provider ? `${context.model.provider}/` : ""}${model}` : "", session ? `Session: ${session}` : "", lastResponse ? `Last response:\n${truncatePlainText(lastResponse, 1_500)}` : ""].filter(Boolean).join("\n\n"))}</details>`].filter(Boolean).join("\n\n");
+	return ["🔔 <b>Pi agent idle</b>", project ? `<b>Project</b> ${telegramHtml(project, 200)}` : "", "Finished and waiting for your next input.",
+		`<details><summary>Details</summary>${telegramHtml([model ? `Model: ${context.model?.provider ? `${context.model.provider}/` : ""}${model}` : "", session ? `Session: ${session}` : "", lastResponse ? `Last response:\n${lastResponse}` : ""].filter(Boolean).join("\n\n"), 1_400)}</details>`].filter(Boolean).join("\n\n");
 }
 
 function safeCall<T>(fn: () => T): T | undefined {

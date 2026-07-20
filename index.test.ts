@@ -836,7 +836,7 @@ describe("ask_user", () => {
 			stubFetch((url) => {
 				const method = url.split("/").pop()!;
 				calls.push(method);
-				if (method === "sendMessage") {
+				if ((method === "sendMessage" || method === "sendRichMessage")) {
 					return telegramOk({ message_id: 76, chat: { id: 4242 } });
 				}
 				return telegramOk([]);
@@ -868,7 +868,7 @@ describe("ask_user", () => {
 			);
 
 			expect(result.details.timedOut).toBe(true);
-			expect(calls).toContain("sendMessage");
+			expect(calls).toContain("sendRichMessage");
 		});
 
 		test("accepts the legacy piAskUser.telegram settings namespace", async () => {
@@ -879,7 +879,7 @@ describe("ask_user", () => {
 			stubFetch((url) => {
 				const method = url.split("/").pop()!;
 				calls.push(method);
-				if (method === "sendMessage") {
+				if ((method === "sendMessage" || method === "sendRichMessage")) {
 					return telegramOk({ message_id: 77, chat: { id: 4242 } });
 				}
 				return telegramOk([]);
@@ -893,7 +893,7 @@ describe("ask_user", () => {
 				{ hasUI: true, ui: { custom: async () => null } },
 			);
 
-			expect(calls).toContain("sendMessage");
+			expect(calls).toContain("sendRichMessage");
 		});
 
 		test("sends the full question payload with quick-reply buttons", async () => {
@@ -905,7 +905,7 @@ describe("ask_user", () => {
 				const method = url.split("/").pop()!;
 				const body = jsonBody(init);
 				calls.push({ method, body });
-				if (method === "sendMessage")
+				if ((method === "sendMessage" || method === "sendRichMessage"))
 					return telegramOk({ message_id: 77, chat: { id: 4242 } });
 				if (method === "getUpdates") return telegramOk([]);
 				return telegramOk(true);
@@ -932,17 +932,17 @@ describe("ask_user", () => {
 				},
 			);
 
-			const sendMessage = calls.find((call) => call.method === "sendMessage");
+			const sendMessage = calls.find((call) => (call.method === "sendMessage" || call.method === "sendRichMessage"));
 			expect(sendMessage?.body.chat_id).toBe("4242");
-			expect(sendMessage?.body.text).toContain("Which deployment target?");
-			expect(sendMessage?.body.text).toContain(
+			expect((sendMessage?.body.rich_message?.html ?? sendMessage?.body.text)).toContain("Which deployment target?");
+			expect((sendMessage?.body.rich_message?.html ?? sendMessage?.body.text)).toContain(
 				"Staging has already passed smoke tests.",
 			);
-			expect(sendMessage?.body.text).toContain("A. Staging");
-			expect(sendMessage?.body.text).toContain(
+			expect((sendMessage?.body.rich_message?.html ?? sendMessage?.body.text)).toContain("A. Staging");
+			expect((sendMessage?.body.rich_message?.html ?? sendMessage?.body.text)).toContain(
 				"B. Production — Customer-facing environment",
 			);
-			expect(sendMessage?.body.text).not.toContain("Request ID:");
+			expect((sendMessage?.body.rich_message?.html ?? sendMessage?.body.text)).not.toContain("Request ID:");
 			expect(
 				sendMessage?.body.reply_markup.inline_keyboard[0].map(
 					(button: any) => button.text,
@@ -951,6 +951,33 @@ describe("ask_user", () => {
 			expect(sendMessage?.body.reply_markup.inline_keyboard[1][0].text).toBe(
 				"✏️ Custom answer",
 			);
+		});
+
+		test("uses a clean regular payload only after a definitive rich rejection", async () => {
+			stubTelegramSettings("123456:TEST_TOKEN_CLEAN_FALLBACK", "4242");
+			const tool = await setupTool();
+			const calls: Array<{ method: string; body: any }> = [];
+			stubFetch((url, init) => {
+				const method = url.split("/").pop()!; const body = jsonBody(init); calls.push({ method, body });
+				if (method === "sendRichMessage") return new Response(JSON.stringify({ ok: false, description: "Bad Request: rich_message is unsupported" }), { status: 400 });
+				if (method === "sendMessage") return telegramOk({ message_id: 78, chat: { id: 4242 } });
+				return telegramOk([]);
+			});
+			await tool.execute("fallback", { question: "<>&\"".repeat(2000), options: ["<>&\""] }, undefined, undefined, { hasUI: true, ui: { custom: async () => null } });
+			const regular = calls.find((call) => call.method === "sendMessage")?.body;
+			expect(regular?.rich_message).toBeUndefined();
+			expect(regular?.parse_mode).toBe("HTML");
+			expect(regular?.text.length).toBeLessThanOrEqual(3900);
+			expect(calls.filter((call) => call.method === "sendMessage")).toHaveLength(1);
+		});
+
+		test("does not retry an ambiguous rich send failure", async () => {
+			stubTelegramSettings("123456:TEST_TOKEN_NO_DUPLICATE", "4242");
+			const tool = await setupTool(); const calls: string[] = [];
+			stubFetch((url) => { const method = url.split("/").pop()!; calls.push(method); if (method === "sendRichMessage") throw new Error("network timeout"); return telegramOk([]); });
+			await tool.execute("ambiguous", { question: "No duplicate", options: ["A"] }, undefined, undefined, { hasUI: true, ui: { custom: async () => null } });
+			expect(calls).toContain("sendRichMessage");
+			expect(calls).not.toContain("sendMessage");
 		});
 
 		test("suppresses an ask_user Telegram message when answered before the delay", async () => {
@@ -989,7 +1016,7 @@ describe("ask_user", () => {
 				selections: ["Yes"],
 			});
 			await new Promise((resolve) => setTimeout(resolve, 40));
-			expect(calls.some((call) => call.method === "sendMessage")).toBe(false);
+			expect(calls.some((call) => (call.method === "sendMessage" || call.method === "sendRichMessage"))).toBe(false);
 		});
 
 		test("edits the Telegram ask message when answered from the local UI", async () => {
@@ -1001,7 +1028,7 @@ describe("ask_user", () => {
 				const method = url.split("/").pop()!;
 				const body = jsonBody(init);
 				calls.push({ method, body });
-				if (method === "sendMessage") {
+				if ((method === "sendMessage" || method === "sendRichMessage")) {
 					return telegramOk({ message_id: 177, chat: { id: 4242 } });
 				}
 				if (method === "getUpdates") return telegramOk([]);
@@ -1035,8 +1062,8 @@ describe("ask_user", () => {
 				(call) => call.method === "editMessageText",
 			);
 			expect(editMessage?.body.message_id).toBe(177);
-			expect(editMessage?.body.text).toContain("✅ Answered:");
-			expect(editMessage?.body.text).toContain("Local");
+			expect((editMessage?.body.rich_message?.html ?? editMessage?.body.text)).toContain("Answered:");
+			expect((editMessage?.body.rich_message?.html ?? editMessage?.body.text)).toContain("Local");
 			expect(editMessage?.body.reply_markup).toEqual({ inline_keyboard: [] });
 		});
 
@@ -1047,7 +1074,7 @@ describe("ask_user", () => {
 
 			stubFetch((url) => {
 				const method = url.split("/").pop()!;
-				if (method === "sendMessage") {
+				if ((method === "sendMessage" || method === "sendRichMessage")) {
 					return new Response(
 						JSON.stringify({
 							ok: false,
@@ -1097,7 +1124,7 @@ describe("ask_user", () => {
 				const method = url.split("/").pop()!;
 				const body = jsonBody(init);
 				calls.push({ method, body });
-				if (method === "sendMessage") {
+				if ((method === "sendMessage" || method === "sendRichMessage")) {
 					callbackData = body.reply_markup.inline_keyboard[0][1].callback_data;
 					return telegramOk({ message_id: 88, chat: { id: 4242 } });
 				}
@@ -1153,8 +1180,8 @@ describe("ask_user", () => {
 			);
 			expect(editMessage?.body.chat_id).toBe("4242");
 			expect(editMessage?.body.message_id).toBe(88);
-			expect(editMessage?.body.text).toContain("✅ Answered:");
-			expect(editMessage?.body.text).toContain("Blue");
+			expect((editMessage?.body.rich_message?.html ?? editMessage?.body.text)).toContain("Answered:");
+			expect((editMessage?.body.rich_message?.html ?? editMessage?.body.text)).toContain("Blue");
 			expect(editMessage?.body.reply_markup).toEqual({ inline_keyboard: [] });
 		});
 
@@ -1169,7 +1196,7 @@ describe("ask_user", () => {
 			stubFetch(async (url, init) => {
 				const method = url.split("/").pop()!;
 				const body = jsonBody(init);
-				if (method === "sendMessage") {
+				if ((method === "sendMessage" || method === "sendRichMessage")) {
 					if (body.reply_to_message_id === initialMessageId) {
 						promptSent = true;
 						return telegramOk({ message_id: 93, chat: { id: 4242 } });
@@ -1248,7 +1275,7 @@ describe("ask_user", () => {
 
 			stubFetch(async (url) => {
 				const method = url.split("/").pop()!;
-				if (method === "sendMessage") {
+				if ((method === "sendMessage" || method === "sendRichMessage")) {
 					messageId = 91;
 					return telegramOk({ message_id: messageId, chat: { id: 4242 } });
 				}
@@ -1313,7 +1340,7 @@ describe("ask_user", () => {
 				const method = url.split("/").pop()!;
 				const body = jsonBody(init);
 				calls.push({ method, body });
-				if (method === "sendMessage") {
+				if ((method === "sendMessage" || method === "sendRichMessage")) {
 					messageId = 94;
 					return telegramOk({ message_id: messageId, chat: { id: 4242 } });
 				}
@@ -1370,7 +1397,7 @@ describe("ask_user", () => {
 				(call) => call.method === "editMessageText",
 			);
 			expect(editMessage?.body.message_id).toBe(messageId);
-			expect(editMessage?.body.text).toContain(
+			expect((editMessage?.body.rich_message?.html ?? editMessage?.body.text)).toContain(
 				"Blue — Keep audit logging enabled.",
 			);
 		});
@@ -1385,9 +1412,9 @@ describe("ask_user", () => {
 			stubFetch(async (url, init) => {
 				const method = url.split("/").pop()!;
 				const body = jsonBody(init);
-				if (method === "sendMessage") {
+				if ((method === "sendMessage" || method === "sendRichMessage")) {
 					sendCount += 1;
-					const question = String(body.text).includes("First question")
+					const question = String(body.rich_message?.html ?? body.text).includes("First question")
 						? "first"
 						: "second";
 					const selectedButton =
@@ -1479,9 +1506,9 @@ describe("ask_user", () => {
 			stubFetch(async (url, init) => {
 				const method = url.split("/").pop()!;
 				const body = jsonBody(init);
-				if (method === "sendMessage") {
+				if ((method === "sendMessage" || method === "sendRichMessage")) {
 					sendCount += 1;
-					const question = String(body.text).includes("Session one")
+					const question = String(body.rich_message?.html ?? body.text).includes("Session one")
 						? "first"
 						: "second";
 					const selectedButton =
@@ -1615,12 +1642,12 @@ describe("ask_user", () => {
 				messages: [{ role: "assistant", content: "Background work continues" }],
 			});
 			await new Promise((resolve) => setTimeout(resolve, 30));
-			expect(calls.some((call) => call.method === "sendRichMessage" || call.method === "sendMessage")).toBe(false);
+			expect(calls.some((call) => call.method === "sendRichMessage" || (call.method === "sendMessage" || call.method === "sendRichMessage"))).toBe(false);
 
 			emitExtensionEvent(extension, "subagent:async-complete", {
 				runId: "async-run-1",
 			});
-			await waitUntil(() => calls.some((call) => call.method === "sendRichMessage" || call.method === "sendMessage"));
+			await waitUntil(() => calls.some((call) => call.method === "sendRichMessage" || (call.method === "sendMessage" || call.method === "sendRichMessage")));
 			await runExtensionHandlers(extension, "session_shutdown");
 		});
 
@@ -1676,13 +1703,13 @@ describe("ask_user", () => {
 				},
 			);
 
-			expect(calls.some((call) => call.method === "sendRichMessage" || call.method === "sendMessage")).toBe(false);
-			await waitUntil(() => calls.some((call) => call.method === "sendRichMessage" || call.method === "sendMessage"));
-			const notification = calls.find((call) => call.method === "sendRichMessage" || call.method === "sendMessage");
+			expect(calls.some((call) => call.method === "sendRichMessage" || (call.method === "sendMessage" || call.method === "sendRichMessage"))).toBe(false);
+			await waitUntil(() => calls.some((call) => call.method === "sendRichMessage" || (call.method === "sendMessage" || call.method === "sendRichMessage")));
+			const notification = calls.find((call) => call.method === "sendRichMessage" || (call.method === "sendMessage" || call.method === "sendRichMessage"));
 			expect(notification?.body.chat_id).toBe("4242");
-			expect(notification?.body.rich_message?.html ?? notification?.body.text).toContain("Pi agent idle");
-			expect(notification?.body.rich_message?.html ?? notification?.body.text).toContain("project");
-			expect(notification?.body.rich_message?.html ?? notification?.body.text).toContain("All done. Ready?");
+			expect(notification?.body.rich_message?.html ?? (notification?.body.rich_message?.html ?? notification?.body.text)).toContain("Pi agent idle");
+			expect(notification?.body.rich_message?.html ?? (notification?.body.rich_message?.html ?? notification?.body.text)).toContain("project");
+			expect(notification?.body.rich_message?.html ?? (notification?.body.rich_message?.html ?? notification?.body.text)).toContain("All done. Ready?");
 			await runExtensionHandlers(extension, "session_shutdown");
 		});
 
@@ -1705,7 +1732,7 @@ describe("ask_user", () => {
 			});
 			await new Promise((resolve) => setTimeout(resolve, 40));
 
-			expect(calls.some((call) => call.method === "sendMessage")).toBe(false);
+			expect(calls.some((call) => (call.method === "sendMessage" || call.method === "sendRichMessage"))).toBe(false);
 			await runExtensionHandlers(extension, "session_shutdown");
 		});
 
@@ -1717,7 +1744,7 @@ describe("ask_user", () => {
 			stubFetch((url, init) => {
 				const method = url.split("/").pop()!;
 				calls.push({ method, body: jsonBody(init) });
-				if (method === "sendMessage") {
+				if ((method === "sendMessage" || method === "sendRichMessage")) {
 					return telegramOk({ message_id: 503, chat: { id: 4242 } });
 				}
 				return telegramOk(true);
@@ -1727,7 +1754,7 @@ describe("ask_user", () => {
 				messages: [{ role: "assistant", content: "Done" }],
 			});
 			await waitUntil(() =>
-				calls.some((call) => call.method === "sendMessage"),
+				calls.some((call) => (call.method === "sendMessage" || call.method === "sendRichMessage")),
 			);
 			await runExtensionHandlers(extension, "before_agent_start", {
 				prompt: "Continuemos",
@@ -1737,7 +1764,7 @@ describe("ask_user", () => {
 				(call) => call.method === "editMessageText",
 			);
 			expect(editMessage?.body.message_id).toBe(503);
-			expect(editMessage?.body.text).toContain("✅ Resumed");
+			expect((editMessage?.body.rich_message?.html ?? editMessage?.body.text)).toContain("✅ Resumed");
 			await runExtensionHandlers(extension, "session_shutdown");
 		});
 	});
