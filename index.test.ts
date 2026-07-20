@@ -1207,20 +1207,25 @@ describe("ask_user", () => {
 			expect(existsSync(join(live, "2.json.done"))).toBe(true); expect(existsSync(join(live, "3.json"))).toBe(true); expect(existsSync(join(live, "4.json.claimed.owner"))).toBe(true);
 		});
 
-		test("sweeps expired completions beyond former directory and entry prefixes", async () => {
+		test("sweeps every expired completion beyond former directory and entry prefixes", async () => {
 			const lease = await hooks();
 			const store = lease.storeForConfig({ botToken: "inbox-cleanup-large", chatId: "4242", apiBaseUrl: "https://telegram.test" });
 			rmSync(store.rootDir, { recursive: true, force: true });
-			for (let i = 0; i <= 100; i++) mkdirSync(join(store.inboxDir, `session-${String(i).padStart(3, "0")}`), { recursive: true });
-			const target = join(store.inboxDir, "zz-target"); mkdirSync(target, { recursive: true });
-			for (let i = 0; i <= 500; i++) writeFileSync(join(target, `entry-${String(i).padStart(3, "0")}.json.done`), "{}");
-			const expired = join(target, "zz-expired.json.done"); writeFileSync(expired, "{}");
-			utimesSync(expired, new Date(Date.now() - 8 * 24 * 60 * 60 * 1_000), new Date(Date.now() - 8 * 24 * 60 * 60 * 1_000));
-			writeFileSync(join(target, "preserve.json"), "{}"); writeFileSync(join(target, "preserve.json.claimed.owner"), "{}");
+			const expiredAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1_000);
+			const expired: string[] = [];
+			for (let i = 0; i <= 100; i++) {
+				const path = join(store.inboxDir, `session-${String(i).padStart(3, "0")}`, "done.json.done");
+				mkdirSync(join(store.inboxDir, `session-${String(i).padStart(3, "0")}`), { recursive: true });
+				writeFileSync(path, "{}"); utimesSync(path, expiredAt, expiredAt); expired.push(path);
+			}
+			const target = join(store.inboxDir, "many-expired"); mkdirSync(target, { recursive: true });
+			for (let i = 0; i <= 500; i++) {
+				const path = join(target, `entry-${String(i).padStart(3, "0")}.json.done`);
+				writeFileSync(path, "{}"); utimesSync(path, expiredAt, expiredAt); expired.push(path);
+			}
 			await lease.cleanupInboxDone(store);
-			expect(existsSync(expired)).toBe(false);
-			expect(existsSync(join(target, "entry-500.json.done"))).toBe(true);
-			expect(existsSync(join(target, "preserve.json"))).toBe(true); expect(existsSync(join(target, "preserve.json.claimed.owner"))).toBe(true);
+			expect(expired).toHaveLength(602);
+			expect(expired.filter(existsSync)).toEqual([]);
 		});
 	});
 
