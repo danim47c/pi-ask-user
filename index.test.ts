@@ -968,6 +968,7 @@ describe("ask_user", () => {
 			expect(regular?.rich_message).toBeUndefined();
 			expect(regular?.parse_mode).toBe("HTML");
 			expect(regular?.text.length).toBeLessThanOrEqual(3900);
+			expect(regular?.text).not.toMatch(/&(amp|lt|gt)(?!;)/);
 			expect(calls.filter((call) => call.method === "sendMessage")).toHaveLength(1);
 		});
 
@@ -976,6 +977,15 @@ describe("ask_user", () => {
 			const tool = await setupTool(); const calls: string[] = [];
 			stubFetch((url) => { const method = url.split("/").pop()!; calls.push(method); if (method === "sendRichMessage") throw new Error("network timeout"); return telegramOk([]); });
 			await tool.execute("ambiguous", { question: "No duplicate", options: ["A"] }, undefined, undefined, { hasUI: true, ui: { custom: async () => null } });
+			expect(calls).toContain("sendRichMessage");
+			expect(calls).not.toContain("sendMessage");
+		});
+
+		test("does not fall back for a generic unsupported rich send error", async () => {
+			stubTelegramSettings("123456:TEST_TOKEN_GENERIC_UNSUPPORTED", "4242");
+			const tool = await setupTool(); const calls: string[] = [];
+			stubFetch((url) => { const method = url.split("/").pop()!; calls.push(method); if (method === "sendRichMessage") return new Response(JSON.stringify({ ok: false, description: "Bad Request: unsupported" }), { status: 400 }); return telegramOk([]); });
+			await tool.execute("generic-unsupported", { question: "No fallback", options: ["A"] }, undefined, undefined, { hasUI: true, ui: { custom: async () => null } });
 			expect(calls).toContain("sendRichMessage");
 			expect(calls).not.toContain("sendMessage");
 		});
@@ -1038,8 +1048,8 @@ describe("ask_user", () => {
 			const result = await tool.execute(
 				"tool-call-id",
 				{
-					question: "Pick locally",
-					options: ["Local", "Remote"],
+					question: "<>&\"".repeat(2_000),
+					options: ["<>&\"".repeat(2_000), "Remote"],
 				},
 				undefined,
 				undefined,
@@ -1048,7 +1058,7 @@ describe("ask_user", () => {
 					ui: {
 						custom: async () => ({
 							kind: "selection",
-							selections: ["Local"],
+							selections: ["<>&\"".repeat(2_000)],
 						}),
 					},
 				},
@@ -1056,14 +1066,17 @@ describe("ask_user", () => {
 
 			expect(result.details.response).toEqual({
 				kind: "selection",
-				selections: ["Local"],
+				selections: ["<>&\"".repeat(2_000)],
 			});
 			const editMessage = calls.find(
 				(call) => call.method === "editMessageText",
 			);
 			expect(editMessage?.body.message_id).toBe(177);
-			expect((editMessage?.body.rich_message?.html ?? editMessage?.body.text)).toContain("Answered:");
-			expect((editMessage?.body.rich_message?.html ?? editMessage?.body.text)).toContain("Local");
+			const editedHtml = editMessage?.body.rich_message?.html ?? editMessage?.body.text;
+			expect(editedHtml).toContain("Answered:");
+			expect(editedHtml).toContain("&lt;&gt;&amp;");
+			expect(editedHtml.length).toBeLessThanOrEqual(3900);
+			expect(editedHtml).not.toMatch(/&(amp|lt|gt)(?!;)/);
 			expect(editMessage?.body.reply_markup).toEqual({ inline_keyboard: [] });
 		});
 

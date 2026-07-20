@@ -485,13 +485,47 @@ function escapeTelegramHtml(text: string): string {
 }
 
 function telegramHtml(text: string, maxLength = TELEGRAM_MAX_MESSAGE_LENGTH): string {
+	if (maxLength <= 0) return "";
 	let output = "";
+	let truncated = false;
+	// Reserve the ellipsis before accepting an atom: never slice escaped HTML.
 	for (const character of text) {
 		const escaped = escapeTelegramHtml(character);
-		if (output.length + escaped.length > maxLength) break;
+		if (output.length + escaped.length + 1 > maxLength) {
+			truncated = true;
+			break;
+		}
 		output += escaped;
 	}
-	return output.length < text.length ? `${output.slice(0, Math.max(0, maxLength - 1))}…` : output;
+	return truncated ? `${output}…` : output;
+}
+
+type TelegramHtmlPart = { html: string } | { text: string };
+
+/** Builds one balanced, bounded HTML message from trusted markup and text atoms. */
+function buildBoundedTelegramHtml(parts: TelegramHtmlPart[], maxLength = TELEGRAM_MAX_MESSAGE_LENGTH): string {
+	const fixedLength = parts.reduce((length, part) => length + ("html" in part ? part.html.length : 0), 0);
+	if (fixedLength > maxLength) throw new Error("Telegram message markup exceeds its limit");
+	let remaining = maxLength - fixedLength;
+	let output = "";
+	let truncated = false;
+	for (const part of parts) {
+		if ("html" in part) {
+			output += part.html;
+			continue;
+		}
+		if (truncated) continue;
+		for (const character of part.text) {
+			const escaped = telegramHtml(character, maxLength);
+			if (remaining < escaped.length + 1) {
+				truncated = true;
+				break;
+			}
+			output += escaped;
+			remaining -= escaped.length;
+		}
+	}
+	return truncated ? `${output}…` : output;
 }
 
 async function resolveTelegramTopicName(): Promise<string | null> {
@@ -665,19 +699,31 @@ function buildTelegramInlineKeyboard(
 
 interface TelegramRenderedMessage { rich: string; regular: string }
 
-/** Build bounded, balanced HTML once; dynamic values are escaped before truncation. */
+function askMessageParts(request: AskNotificationRequest, rich: boolean): TelegramHtmlPart[] {
+	const choices = request.options.slice(0, 6);
+	const parts: TelegramHtmlPart[] = [
+		{ html: "🔔 <b>ask_user</b>\n\n<b>Question</b> " }, { text: request.question },
+		{ html: choices.length ? "\n\n<b>Choices</b>\n" : "\n\n<i>Freeform answer requested</i>" },
+	];
+	for (const [index, option] of choices.entries()) {
+		if (index) parts.push({ html: "\n" });
+		parts.push({ html: `${telegramOptionLabel(index)}. ` }, { text: option.title });
+		if (option.description) parts.push({ html: " — " }, { text: option.description });
+	}
+	parts.push({ html: "\n\n<i>Use a button or reply to this message.</i>" });
+	if (request.context) {
+		parts.push({ html: rich ? "\n\n<details><summary>Details</summary>" : "\n\n<b>Details</b>\n" }, { text: request.context });
+		if (rich) parts.push({ html: "</details>" });
+	}
+	return parts;
+}
+
+/** Both transports receive independently balanced, whole-message bounded HTML. */
 function renderTelegramAskMessage(request: AskNotificationRequest): TelegramRenderedMessage {
-	const choices = request.options.slice(0, 6).map((option, index) =>
-		`${telegramOptionLabel(index)}. ${telegramHtml(option.title, 90)}${option.description ? ` — ${telegramHtml(option.description, 90)}` : ""}`).join("\n");
-	const question = telegramHtml(request.question, 400);
-	const context = request.context ? telegramHtml(request.context, 400) : "";
-	const details = [context, choices].filter(Boolean).join("\n\n");
-	const core = ["🔔 <b>ask_user</b>", `<b>Question</b> ${question}`,
-		choices ? `<b>Choices</b>\n${choices}` : "<i>Freeform answer requested</i>",
-		"<i>Use a button or reply to this message.</i>"].join("\n\n");
-	const regular = [core, details ? `<b>Details</b>\n${details}` : ""].filter(Boolean).join("\n\n");
-	const rich = [core, details ? `<details><summary>Details</summary>${details}</details>` : ""].filter(Boolean).join("\n\n");
-	return { rich, regular };
+	return {
+		rich: buildBoundedTelegramHtml(askMessageParts(request, true)),
+		regular: buildBoundedTelegramHtml(askMessageParts(request, false)),
+	};
 }
 
 function buildTelegramAskMessage(requestId: string, request: AskNotificationRequest): string {
@@ -686,11 +732,14 @@ function buildTelegramAskMessage(requestId: string, request: AskNotificationRequ
 }
 
 function buildTelegramAnsweredMessage(record: SharedTelegramAskRecord, response: AskResponse): string {
-	return `✅ <b>Answered:</b>\n${telegramHtml(record.request.question)}\n\n<b>Response</b> ${telegramHtml(formatResponseSummary(response))}`;
+	return buildBoundedTelegramHtml([
+		{ html: "✅ <b>Answered:</b>\n" }, { text: record.request.question },
+		{ html: "\n\n<b>Response</b> " }, { text: formatResponseSummary(response) },
+	]);
 }
 
 function buildTelegramCancelledAskMessage(record: SharedTelegramAskRecord): string {
-	return `⚪ <b>Cancelled</b>\n${telegramHtml(record.request.question)}`;
+	return buildBoundedTelegramHtml([{ html: "⚪ <b>Cancelled</b>\n" }, { text: record.request.question }]);
 }
 
 function normalizeTelegramToken(value: string): string {
@@ -972,93 +1021,86 @@ async function writeSharedOffset(
 	});
 }
 
-async function tryAcquireTelegramPollLock(
-	store: TelegramSharedStore,
-): Promise<TelegramPollLock | null> {
-	await ensureTelegramStoreDirs(store);
-	const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+interface TelegramLeaseOwner { token: string; pid: number; heartbeatAt: number }
 
-	const writeOwner = async () => {
-		await writeJsonFileAtomic(store.lockFile, {
-			token,
-			pid: process.pid,
-			heartbeatAt: Date.now(),
-		});
-	};
+function telegramLeaseToken(): string {
+	return `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
 
-	try {
-		await mkdir(store.lockDir, { mode: 0o700 });
-	} catch (error) {
-		if (!isErrno(error, "EEXIST")) throw error;
-
-		const owner = await readJsonFile<{ heartbeatAt?: number }>(store.lockFile);
-		const heartbeatAt = owner?.heartbeatAt;
-		if (heartbeatAt !== undefined) {
-			if (Date.now() - heartbeatAt < TELEGRAM_LOCK_STALE_MS) return null;
-		} else {
-			const lockStats = await stat(store.lockDir).catch(() => null);
-			const lockAgeMs = lockStats
-				? Date.now() - lockStats.mtimeMs
-				: TELEGRAM_LOCK_STALE_MS;
-			if (lockAgeMs < TELEGRAM_LOCK_STALE_MS) return null;
-		}
-
-		await rm(store.lockDir, { recursive: true, force: true });
-		try {
-			await mkdir(store.lockDir, { mode: 0o700 });
-		} catch (retryError) {
-			if (isErrno(retryError, "EEXIST")) return null;
-			throw retryError;
-		}
+async function reclaimTelegramLease(lockDir: string, owner: TelegramLeaseOwner, staleMs: number): Promise<boolean> {
+	if (Date.now() - owner.heartbeatAt < staleMs) return false;
+	const tombstone = `${lockDir}.reclaim.${owner.token}`;
+	try { await mkdir(tombstone, { mode: 0o700 }); } catch (error) {
+		if (isErrno(error, "EEXIST")) return false;
+		throw error;
 	}
+	try {
+		const current = await readJsonFile<TelegramLeaseOwner>(join(lockDir, "owner.json"));
+		if (current?.token !== owner.token || Date.now() - current.heartbeatAt < staleMs) return false;
+		// The token-specific tombstone blocks all compliant acquirers before this move.
+		await rename(lockDir, join(tombstone, "lock"));
+		return true;
+	} catch (error) {
+		if (isErrno(error, "ENOENT")) return false;
+		throw error;
+	} finally {
+		await rm(tombstone, { recursive: true, force: true });
+	}
+}
 
-	await writeOwner();
+async function tryAcquireTelegramLease(lockDir: string, staleMs: number): Promise<TelegramPollLock | null> {
+	const token = telegramLeaseToken();
+	const candidate = `${lockDir}.candidate.${token}`;
+	const ownerFile = join(lockDir, "owner.json");
+	await mkdir(candidate, { mode: 0o700 });
+	await writeJsonFileAtomic(join(candidate, "owner.json"), { token, pid: process.pid, heartbeatAt: Date.now() });
+	try {
+		const entries = await readdir(join(lockDir, ".."));
+		if (entries.some((entry) => entry.startsWith(`${lockDir.split("/").pop()}.reclaim.`))) {
+			await rm(candidate, { recursive: true, force: true });
+			return null;
+		}
+		await rename(candidate, lockDir); // initialized candidate publication is atomic
+	} catch (error) {
+		await rm(candidate, { recursive: true, force: true });
+		if (!isErrno(error, "EEXIST") && !isErrno(error, "ENOTEMPTY")) throw error;
+		const owner = await readJsonFile<TelegramLeaseOwner>(ownerFile);
+		if (owner) await reclaimTelegramLease(lockDir, owner, staleMs);
+		return null;
+	}
 	let released = false;
-
+	const ownsLease = async () => (await readJsonFile<TelegramLeaseOwner>(ownerFile))?.token === token;
 	return {
 		refresh: async () => {
-			if (released) return;
-			await writeOwner();
+			if (released || !(await ownsLease())) return;
+			await writeJsonFileAtomic(ownerFile, { token, pid: process.pid, heartbeatAt: Date.now() });
 		},
 		release: async () => {
 			if (released) return;
 			released = true;
-			const owner = await readJsonFile<{ token?: string }>(store.lockFile);
-			if (owner?.token === token) {
-				await rm(store.lockDir, { recursive: true, force: true });
-			}
+			if (await ownsLease()) await rm(lockDir, { recursive: true, force: true });
 		},
 	};
+}
+
+async function tryAcquireTelegramPollLock(store: TelegramSharedStore): Promise<TelegramPollLock | null> {
+	await ensureTelegramStoreDirs(store);
+	return await tryAcquireTelegramLease(store.lockDir, TELEGRAM_LOCK_STALE_MS);
 }
 
 interface TelegramTopicMap { topics: Record<string, number> }
 
 async function withTelegramTopicLock<T>(store: TelegramSharedStore, operation: () => Promise<T>): Promise<T> {
-	await ensureTelegramStoreDirs(store); // also creates root before an idle-first lock
-	const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-	const ownerFile = join(store.topicLockDir, "owner.json");
+	await ensureTelegramStoreDirs(store);
 	const deadline = Date.now() + 5_000;
 	while (true) {
-		try { await mkdir(store.topicLockDir, { mode: 0o700 }); break; } catch (error) {
-			if (!isErrno(error, "EEXIST")) throw error;
-			const owner = await readJsonFile<{ token?: string; heartbeatAt?: number }>(ownerFile);
-			if ((owner?.heartbeatAt ?? 0) + 10_000 < Date.now()) {
-				// Only reclaim the owner we inspected; a live owner refreshes its token.
-				const current = await readJsonFile<{ token?: string }>(ownerFile);
-				if (current?.token === owner?.token) await rm(store.topicLockDir, { recursive: true, force: true });
-				continue;
-			}
-			if (Date.now() >= deadline) throw new Error("Timed out locking Telegram topic state");
-			await delay(25);
+		const lock = await tryAcquireTelegramLease(store.topicLockDir, 10_000);
+		if (lock) {
+			const heartbeat = setInterval(() => { void lock.refresh(); }, 2_000);
+			try { return await operation(); } finally { clearInterval(heartbeat); await lock.release(); }
 		}
-	}
-	const refresh = async () => await writeJsonFileAtomic(ownerFile, { token, heartbeatAt: Date.now() });
-	await refresh();
-	const heartbeat = setInterval(() => { void refresh(); }, 2_000);
-	try { return await operation(); } finally {
-		clearInterval(heartbeat);
-		const owner = await readJsonFile<{ token?: string }>(ownerFile);
-		if (owner?.token === token) await rm(store.topicLockDir, { recursive: true, force: true });
+		if (Date.now() >= deadline) throw new Error("Timed out locking Telegram topic state");
+		await delay(25);
 	}
 }
 
@@ -1067,11 +1109,14 @@ class TelegramApiError extends Error {
 }
 
 function isRichMessageUnsupported(error: unknown): boolean {
-	return error instanceof TelegramApiError && /rich_message|rich message|unsupported|can't parse entities|parse entities/i.test(error.description);
+	return error instanceof TelegramApiError && (
+		/(?:rich_message|sendRichMessage|formatted rich)/i.test(error.description) && /(?:unsupported|not supported|invalid|unknown)/i.test(error.description)
+		|| /(?:can't parse|parse) entities/i.test(error.description)
+	);
 }
 
 function isInvalidTopic(error: unknown): boolean {
-	return error instanceof TelegramApiError && /message thread|topic.*(?:not found|invalid)|thread.*(?:not found|invalid)/i.test(error.description);
+	return error instanceof TelegramApiError && /(?:message[ _-]?thread|topic|thread)\s+(?:was\s+)?(?:not found|invalid|deleted|closed)|(?:not found|invalid|deleted|closed)\s+(?:message[ _-]?thread|topic|thread)/i.test(error.description);
 }
 
 class TelegramBotPoller {
@@ -1147,14 +1192,15 @@ class TelegramBotPoller {
 		return this.topicId ?? undefined;
 	}
 
-	private async invalidateTopic(): Promise<void> {
+	private async invalidateTopic(rejectedThreadId: number): Promise<void> {
 		this.topicId = undefined;
 		const name = await resolveTelegramTopicName();
 		if (!name) return;
 		const key = createHash("sha256").update(name).digest("hex");
 		await withTelegramTopicLock(this.store, async () => {
 			const map = await readJsonFile<TelegramTopicMap>(this.store.topicFile);
-			if (!map?.topics[key]) return;
+			// Do not erase a replacement created by another process.
+			if (!map || map.topics[key] !== rejectedThreadId) return;
 			delete map.topics[key];
 			await writeJsonFileAtomic(this.store.topicFile, map);
 		});
@@ -1180,7 +1226,7 @@ class TelegramBotPoller {
 			try { return await send(threadId); }
 			catch (error) {
 				if (threadId === undefined || !isInvalidTopic(error)) throw error;
-				await this.invalidateTopic();
+				await this.invalidateTopic(threadId);
 				return await send(await this.getMessageThreadId());
 			}
 		} finally { clearTimeout(timeout); }
@@ -1774,20 +1820,26 @@ function cancelPendingAgentEndTelegramNotice(): void {
 function scheduleAgentEndTelegramNotice(event: unknown, ctx: unknown): void {
 	cancelPendingAgentEndTelegramNotice();
 	const message = buildAgentEndTelegramMessage(event, ctx);
-	const resumedMessage = `${message}\n\n✅ Resumed before this idle notification needed action.`;
+	const resumedMessage = buildAgentEndTelegramMessage(event, ctx, true);
 	const notice = new AgentEndTelegramNotice(message, resumedMessage, ctx);
 	pendingAgentEndTelegramNotice = notice;
 	notice.start();
 }
 
-function buildAgentEndTelegramMessage(event: unknown, ctx: unknown): string {
+function buildAgentEndTelegramMessage(event: unknown, ctx: unknown, resumed = false): string {
 	const context = (ctx ?? {}) as { cwd?: string; model?: { name?: string; id?: string; provider?: string }; sessionManager?: { getSessionId?: () => string | undefined } };
 	const project = context.cwd?.split("/").filter(Boolean).pop();
 	const model = context.model?.name || context.model?.id;
 	const session = safeCall(() => context.sessionManager?.getSessionId?.());
 	const lastResponse = extractLastAssistantText(event);
-	return ["🔔 <b>Pi agent idle</b>", project ? `<b>Project</b> ${telegramHtml(project, 200)}` : "", "Finished and waiting for your next input.",
-		`<details><summary>Details</summary>${telegramHtml([model ? `Model: ${context.model?.provider ? `${context.model.provider}/` : ""}${model}` : "", session ? `Session: ${session}` : "", lastResponse ? `Last response:\n${lastResponse}` : ""].filter(Boolean).join("\n\n"), 1_400)}</details>`].filter(Boolean).join("\n\n");
+	const details = [model ? `Model: ${context.model?.provider ? `${context.model.provider}/` : ""}${model}` : "", session ? `Session: ${session}` : "", lastResponse ? `Last response:\n${lastResponse}` : ""].filter(Boolean).join("\n\n");
+	return buildBoundedTelegramHtml([
+		{ html: "🔔 <b>Pi agent idle</b>\n\n" },
+		...(project ? [{ html: "<b>Project</b> " } as TelegramHtmlPart, { text: project } as TelegramHtmlPart, { html: "\n\n" } as TelegramHtmlPart] : []),
+		{ html: "Finished and waiting for your next input.\n\n<details><summary>Details</summary>" }, { text: details },
+		{ html: "</details>" },
+		...(resumed ? [{ html: "\n\n✅ Resumed before this idle notification needed action." } as TelegramHtmlPart] : []),
+	]);
 }
 
 function safeCall<T>(fn: () => T): T | undefined {
