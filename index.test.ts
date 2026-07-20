@@ -8,7 +8,7 @@ import {
 	test,
 } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1106,9 +1106,66 @@ describe("ask_user", () => {
 			await b.activateSession({ sessionId: "same", cwd: process.cwd() }, async (text: string) => { second.push(text); return "idle"; });
 			const inbox = join(store.inboxDir, createHash("sha256").update("same").digest("hex")); mkdirSync(inbox, { recursive: true });
 			writeFileSync(join(inbox, "602.json"), JSON.stringify({ updateId: 602, text: "recovered", messageId: 2, threadId: 99, createdAt: Date.now() }));
+			// Simulate A crashing after rename but before durable completion. B owns
+			// the recovered claim; A remains fenced by B's fresh registration.
+			writeFileSync(join(inbox, "603.json.claimed.crashed-A"), JSON.stringify({ updateId: 603, text: "claimed recovery", messageId: 3, threadId: 99, createdAt: Date.now() }));
 			await lease.consumeInbox(b);
-			expect(second).toEqual(["recovered"]);
+			expect(second.slice().sort((a, b) => a.localeCompare(b))).toEqual(["claimed recovery", "recovered"]);
+			await lease.consumeInbox(a);
+			expect(first).toEqual([]);
+			expect(readdirSync(inbox).some((entry) => entry.startsWith("603.json.done"))).toBe(true);
 			await a.deactivateSession(); await b.deactivateSession();
+		});
+
+		test("deactivation fences an in-flight lease publication", async () => {
+			const lease = await hooks();
+			const config = { botToken: "deactivate-acquire-race", chatId: "4242", apiBaseUrl: "https://telegram.test" };
+			const store = lease.storeForConfig(config); rmSync(store.rootDir, { recursive: true, force: true });
+			let published = false; let resume!: () => void;
+			const paused = new Promise<void>((resolve) => { resume = resolve; });
+			const calls: string[] = [];
+			stubFetch((url, init) => { const method = url.split("/").pop()!; calls.push(method); if (method === "getUpdates") return new Promise<Response>((resolve) => (init?.signal as AbortSignal).addEventListener("abort", () => resolve(telegramOk([])), { once: true })); return telegramOk({ has_topics_enabled: true }); });
+			lease.setPollingBarrier(async () => { published = true; await paused; });
+			try {
+				const poller = lease.createPoller(config);
+				await poller.activateSession({ sessionId: "race", cwd: process.cwd() }, async () => "idle");
+				await waitUntil(() => published);
+				const stopping = poller.deactivateSession();
+				await new Promise((resolve) => setTimeout(resolve, 2));
+				resume(); await stopping;
+				expect(calls.filter((method) => method === "getUpdates")).toEqual([]);
+				expect(existsSync(store.lockDir)).toBe(false);
+				lease.setPollingBarrier(undefined);
+				await poller.activateSession({ sessionId: "race", cwd: process.cwd() }, async () => "idle");
+				await waitUntil(() => calls.includes("getUpdates"));
+				await poller.deactivateSession();
+			} finally { lease.setPollingBarrier(undefined); }
+		});
+
+		test("durable completion prevents replay after acknowledgement failure", async () => {
+			const lease = await hooks(); const config = { botToken: "ack-failure", chatId: "4242", apiBaseUrl: "https://telegram.test" };
+			const store = lease.storeForConfig(config); rmSync(store.rootDir, { recursive: true, force: true });
+			let reactions = 0; stubFetch((url, init) => { const method = url.split("/").pop()!; if (method === "getUpdates") return new Promise<Response>((resolve) => (init?.signal as AbortSignal).addEventListener("abort", () => resolve(telegramOk([])), { once: true })); if (method === "setMessageReaction") { reactions++; throw new Error("ack unavailable"); } return telegramOk({}); });
+			const delivered: string[] = []; const poller = lease.createPoller(config);
+			await poller.activateSession({ sessionId: "ack", cwd: process.cwd() }, async (text: string) => { delivered.push(text); return "idle"; });
+			const inbox = join(store.inboxDir, createHash("sha256").update("ack").digest("hex")); mkdirSync(inbox, { recursive: true }); writeFileSync(join(inbox, "1.json"), JSON.stringify({ updateId: 1, text: "once", messageId: 1, threadId: 1, createdAt: Date.now() }));
+			await lease.consumeInbox(poller); await lease.consumeInbox(poller);
+			expect(delivered).toEqual(["once"]); expect(reactions).toBe(1);
+			await poller.deactivateSession();
+		});
+
+		test("globally removes only expired durable inbox completions", async () => {
+			const lease = await hooks();
+			const store = lease.storeForConfig({ botToken: "inbox-cleanup", chatId: "4242", apiBaseUrl: "https://telegram.test" });
+			rmSync(store.rootDir, { recursive: true, force: true });
+			const old = join(store.inboxDir, "old"); const live = join(store.inboxDir, "live"); const empty = join(store.inboxDir, "empty");
+			mkdirSync(old, { recursive: true }); mkdirSync(live, { recursive: true }); mkdirSync(empty, { recursive: true });
+			const oldDone = join(old, "1.json.done"); writeFileSync(oldDone, "{}");
+			utimesSync(oldDone, new Date(Date.now() - 8 * 24 * 60 * 60 * 1_000), new Date(Date.now() - 8 * 24 * 60 * 60 * 1_000));
+			writeFileSync(join(live, "2.json.done"), "{}"); writeFileSync(join(live, "3.json"), "{}"); writeFileSync(join(live, "4.json.claimed.owner"), "{}");
+			await lease.cleanupInboxDone(store);
+			expect(existsSync(oldDone)).toBe(false); expect(existsSync(old)).toBe(false); expect(existsSync(empty)).toBe(false);
+			expect(existsSync(join(live, "2.json.done"))).toBe(true); expect(existsSync(join(live, "3.json"))).toBe(true); expect(existsSync(join(live, "4.json.claimed.owner"))).toBe(true);
 		});
 	});
 

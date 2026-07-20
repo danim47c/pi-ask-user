@@ -261,6 +261,12 @@ const TELEGRAM_SEND_TIMEOUT_MS = 10_000;
 const TELEGRAM_RETRY_DELAY_MS = 3_000;
 const TELEGRAM_RESPONSE_POLL_MS = 50;
 const TELEGRAM_LOCK_STALE_MS = 70_000;
+const TELEGRAM_INBOX_DONE_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+
+function telegramRegistrationIntervalMs(): number {
+	const value = Number.parseInt(process.env.PI_TELEGRAM_REGISTRATION_INTERVAL_MS ?? "", 10);
+	return Number.isFinite(value) && value > 0 ? value : 5_000;
+}
 // Keep token tombstone directories forever as ownership fences, while removing
 // their obsolete payloads after this long grace period.
 const TELEGRAM_LOCK_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1_000;
@@ -1062,6 +1068,8 @@ function telegramLeaseTombstone(lockDir: string, token: string): string {
 
 /** Test-only synchronization seam for deterministic lease race tests. */
 let telegramLeaseTestBarrier: ((phase: "reserved" | "tombstoneExists" | "beforeRename" | "beforePublish" | "published") => Promise<void> | void) | undefined;
+/** Test-only seam between poll lease acquisition and loop publication. */
+let telegramPollingTestBarrier: (() => Promise<void> | void) | undefined;
 
 /**
  * A tombstone directory is a permanent, token-specific compare-and-swap fence.
@@ -1195,6 +1203,26 @@ async function enqueueTelegramInbox(store: TelegramSharedStore, sessionId: strin
 	catch (error) { if (isErrno(error, "EEXIST")) return false; throw error; }
 }
 
+/** Best-effort bounded cleanup: only durable completions are eligible. */
+async function cleanupTelegramInboxDone(store: TelegramSharedStore): Promise<void> {
+	const cutoff = Date.now() - TELEGRAM_INBOX_DONE_RETENTION_MS;
+	let sessions: string[];
+	try { sessions = (await readdir(store.inboxDir)).slice(0, 100); }
+	catch (error) { if (isErrno(error, "ENOENT")) return; throw error; }
+	for (const session of sessions) {
+		const dir = join(store.inboxDir, session);
+		try {
+			const entries = (await readdir(dir)).slice(0, 500);
+			for (const entry of entries) {
+				if (!entry.endsWith(".done")) continue;
+				const path = join(dir, entry);
+				if ((await stat(path)).mtimeMs < cutoff) await rm(path, { force: true });
+			}
+			if ((await readdir(dir)).length === 0) await rm(dir, { recursive: true, force: true });
+		} catch (error) { if (!isErrno(error, "ENOENT")) throw error; }
+	}
+}
+
 async function withTelegramTopicLock<T>(store: TelegramSharedStore, operation: () => Promise<T>): Promise<T> {
 	await ensureTelegramStoreDirs(store);
 	const deadline = Date.now() + 5_000;
@@ -1242,6 +1270,10 @@ class TelegramBotPoller {
 	private abortController: AbortController | undefined;
 	private loopPromise: Promise<void> | undefined;
 	private ensurePromise: Promise<void> | undefined;
+	private registrationPromise: Promise<void> = Promise.resolve();
+	// Every asynchronous registration/acquisition carries this fence.  A stale
+	// callback may finish I/O, but can never publish ownership or a poll loop.
+	private activeGeneration = 0;
 
 	constructor(config: TelegramConfig) {
 		this.config = config;
@@ -1251,73 +1283,82 @@ class TelegramBotPoller {
 	setRouting(routing: { sessionId: string; sessionName?: string; getSessionName?: () => string | undefined; cwd: string }): void { this.routing = routing; }
 
 	async activateSession(routing: { sessionId: string; sessionName?: string; getSessionName?: () => string | undefined; cwd: string }, deliver: (text: string) => Promise<"idle" | "followUp">): Promise<void> {
+		// A second session_start first retires the old local generation and timer.
+		await this.deactivateSession();
 		this.setRouting(routing);
-		// Repeated session_start events for this live poller retain its ownership token.
-		const instanceId = this.localSession?.sessionId === routing.sessionId
-			? this.localSession.instanceId
-			: telegramLeaseToken();
-		const register = async () => {
+		const generation = ++this.activeGeneration;
+		const instanceId = telegramLeaseToken();
+		const register = () => this.registrationPromise = this.registrationPromise.then(async () => {
+			if (generation !== this.activeGeneration) return;
 			await withTelegramTopicLock(this.store, async () => {
+				if (generation !== this.activeGeneration) return;
 				const path = registrationPath(this.store, routing.sessionId);
 				const existing = await readJsonFile<TelegramSessionRegistration>(path);
-				if (existing && Date.now() - existing.heartbeatAt <= TELEGRAM_LOCK_STALE_MS && existing.instanceId !== instanceId) {
-					// A fresh owner wins; an old runtime must stop consuming immediately.
-					if (this.localSession?.instanceId === instanceId) this.localSession = undefined;
-					return;
-				}
+				if (generation !== this.activeGeneration) return;
+				if (existing && Date.now() - existing.heartbeatAt <= TELEGRAM_LOCK_STALE_MS && existing.instanceId !== instanceId) return;
 				const map = await readJsonFile<TelegramTopicMap>(this.store.topicFile);
 				const binding = map && topicBinding(map, routing.sessionId);
 				await mkdir(this.store.registrationsDir, { recursive: true, mode: 0o700 });
+				if (generation !== this.activeGeneration) return;
 				await writeJsonFileAtomic(path, { sessionId: routing.sessionId, instanceId, pid: process.pid, heartbeatAt: Date.now(), title: routing.sessionName || routing.sessionId.slice(0, 8), ...(binding ? { threadId: binding.threadId } : {}) });
-				this.localSession = { sessionId: routing.sessionId, instanceId, deliver };
+				if (generation === this.activeGeneration) this.localSession = { sessionId: routing.sessionId, instanceId, deliver };
 			});
-		};
+		});
 		await register();
-		this.registrationTimer = setInterval(() => { void register().then(() => this.consumeInbox()).then(() => this.ensurePolling()); }, 5_000);
-		await this.consumeInbox();
-		void this.ensurePolling();
+		if (generation !== this.activeGeneration || !this.localSession) return;
+		this.registrationTimer = setInterval(() => {
+			if (generation !== this.activeGeneration) return;
+			void register().then(() => generation === this.activeGeneration ? this.consumeInbox(generation) : undefined).then(() => generation === this.activeGeneration ? this.ensurePolling(generation) : undefined);
+		}, telegramRegistrationIntervalMs());
+		await this.consumeInbox(generation);
+		void this.ensurePolling(generation);
+		void cleanupTelegramInboxDone(this.store).catch(() => undefined);
 	}
 
 	async deactivateSession(): Promise<void> {
+		const local = this.localSession;
+		// Invalidate before waiting: callbacks/acquisition completing below cannot publish.
+		++this.activeGeneration;
 		if (this.registrationTimer) clearInterval(this.registrationTimer);
 		this.registrationTimer = undefined;
-		// Release a held poll lease before deleting our registration so a reload can take over.
+		this.localSession = undefined;
+		await this.registrationPromise;
+		await this.ensurePromise;
 		this.abortController?.abort();
 		await this.loopPromise;
-		const local = this.localSession; this.localSession = undefined;
 		if (!local) return;
 		await withTelegramTopicLock(this.store, async () => {
 			const path = registrationPath(this.store, local.sessionId);
 			const current = await readJsonFile<TelegramSessionRegistration>(path);
 			if (current?.instanceId === local.instanceId) await rm(path, { force: true });
 		});
+		void cleanupTelegramInboxDone(this.store).catch(() => undefined);
 	}
 
-	private async consumeInbox(): Promise<void> {
-		const local = this.localSession; if (!local) return;
+	private async consumeInbox(generation = this.activeGeneration): Promise<void> {
+		const local = this.localSession; if (!local || generation !== this.activeGeneration) return;
 		const dir = dirname(inboxPath(this.store, local.sessionId, 0));
 		let entries: string[]; try { entries = await readdir(dir); } catch (error) { if (isErrno(error, "ENOENT")) return; throw error; }
-		const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1_000;
-		for (const entry of entries) {
-			if (!entry.endsWith(".done") && !entry.endsWith(".claimed")) continue;
-			try { if ((await stat(join(dir, entry))).mtimeMs < cutoff) await rm(join(dir, entry), { force: true }); } catch { /* best effort */ }
-		}
-		for (const entry of entries.filter((name) => name.endsWith(".json"))) {
-			const path = join(dir, entry); const claimed = `${path}.claimed`; const done = `${path}.done`;
-			try { await rename(path, claimed); } catch (error) { if (isErrno(error, "ENOENT")) continue; throw error; }
+		for (const entry of entries.filter((name) => name.endsWith(".json") || /\.json\.claimed(?:\.|$)/.test(name))) {
+			if (generation !== this.activeGeneration || this.localSession?.instanceId !== local.instanceId) return;
+			const path = join(dir, entry);
+			const source = entry.endsWith(".json") ? path : path;
+			const claimed = `${path.replace(/\.claimed(?:\.[^.]+)?$/, "")}.claimed.${local.instanceId}`;
+			const done = `${path.replace(/\.claimed(?:\.[^.]+)?$/, "")}.done`;
+			try { if (source !== claimed) await rename(source, claimed); } catch (error) { if (isErrno(error, "ENOENT") || isErrno(error, "EEXIST")) continue; throw error; }
 			const envelope = await readJsonFile<TelegramInboxEnvelope>(claimed); if (!envelope) { await rm(claimed, { force: true }); continue; }
 			await withTelegramTopicLock(this.store, async () => {
-				// Verify ownership after claiming and immediately before Pi injection.
 				const current = await readJsonFile<TelegramSessionRegistration>(registrationPath(this.store, local.sessionId));
-				if (this.localSession?.instanceId !== local.instanceId || !current || current.instanceId !== local.instanceId || Date.now() - current.heartbeatAt > TELEGRAM_LOCK_STALE_MS) {
-					this.localSession = undefined;
-					await rename(claimed, path).catch(() => undefined);
+				if (generation !== this.activeGeneration || this.localSession?.instanceId !== local.instanceId || !current || current.instanceId !== local.instanceId || Date.now() - current.heartbeatAt > TELEGRAM_LOCK_STALE_MS) return;
+				let status: "idle" | "followUp";
+				try { status = await local.deliver(envelope.text); }
+				catch {
+					await this.safeCallApi("sendMessage", { chat_id: this.config.chatId, message_thread_id: envelope.threadId, reply_to_message_id: envelope.messageId, text: "Unable to deliver this message to Pi." });
 					return;
 				}
-				// Completion before injection deliberately favors at-most-once delivery after a crash.
+				// Durable completion is the loss boundary; acknowledgement failures must not replay Pi input.
 				await rename(claimed, done);
-				try { const status = await local.deliver(envelope.text); await this.safeCallApi("setMessageReaction", { chat_id: this.config.chatId, message_id: envelope.messageId, reaction: [{ type: "emoji", emoji: status === "idle" ? "✅" : "⏳" }] }); }
-				catch { await this.safeCallApi("sendMessage", { chat_id: this.config.chatId, message_thread_id: envelope.threadId, reply_to_message_id: envelope.messageId, text: "Unable to deliver this message to Pi." }); }
+				await this.safeCallApi("setMessageReaction", { chat_id: this.config.chatId, message_id: envelope.messageId, reaction: [{ type: "emoji", emoji: status === "idle" ? "✅" : "⏳" }] }).catch(() => undefined);
 			});
 		}
 	}
@@ -1437,20 +1478,32 @@ class TelegramBotPoller {
 		}
 	}
 
-	async ensurePolling(): Promise<void> {
+	async ensurePolling(generation = this.activeGeneration): Promise<void> {
+		if (generation !== this.activeGeneration) return;
 		if (this.loopPromise && !this.abortController?.signal.aborted) return;
 		if (this.ensurePromise) return this.ensurePromise;
 
 		this.ensurePromise = (async () => {
 			const lock = await tryAcquireTelegramPollLock(this.store);
+			await telegramPollingTestBarrier?.();
+			// Lease acquisition is asynchronous: release instead of publishing if
+			// shutdown/re-activation crossed it.
 			if (!lock) return;
-
+			if (generation !== this.activeGeneration) {
+				await lock.release();
+				return;
+			}
 			const controller = new AbortController();
 			const loopPromise = this.pollLoop(controller.signal, lock).finally(() => {
 				if (this.loopPromise !== loopPromise) return;
 				this.loopPromise = undefined;
 				this.abortController = undefined;
 			});
+			if (generation !== this.activeGeneration) {
+				controller.abort();
+				await loopPromise;
+				return;
+			}
 			this.abortController = controller;
 			this.loopPromise = loopPromise;
 		})().finally(() => {
@@ -3710,11 +3763,13 @@ export const __telegramTestHooks = {
 	invalidateTopicMap: invalidateTelegramTopicMap,
 	isInvalidTopicDescription: (description: string) => isInvalidTopic(new TelegramApiError(400, description)),
 	setLeaseBarrier: (barrier: typeof telegramLeaseTestBarrier) => { telegramLeaseTestBarrier = barrier; },
+	setPollingBarrier: (barrier: typeof telegramPollingTestBarrier) => { telegramPollingTestBarrier = barrier; },
 	createPoller: (config: TelegramConfig) => new TelegramBotPoller(config),
 	storeForConfig: createTelegramSharedStore,
 	resolveTopicName: resolveTelegramTopicName,
 	handleUpdate: async (poller: TelegramBotPoller, update: TelegramUpdate) => await (poller as unknown as { handleUpdate: (value: TelegramUpdate) => Promise<void> }).handleUpdate(update),
 	consumeInbox: async (poller: TelegramBotPoller) => await (poller as unknown as { consumeInbox: () => Promise<void> }).consumeInbox(),
+	cleanupInboxDone: cleanupTelegramInboxDone,
 };
 
 export default function (pi: ExtensionAPI) {
