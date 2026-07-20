@@ -1070,6 +1070,8 @@ function telegramLeaseTombstone(lockDir: string, token: string): string {
 let telegramLeaseTestBarrier: ((phase: "reserved" | "tombstoneExists" | "beforeRename" | "beforePublish" | "published") => Promise<void> | void) | undefined;
 /** Test-only seam between poll lease acquisition and loop publication. */
 let telegramPollingTestBarrier: (() => Promise<void> | void) | undefined;
+/** Test-only seam after a session registration is atomically written. */
+let telegramRegistrationTestBarrier: (() => Promise<void> | void) | undefined;
 
 /**
  * A tombstone directory is a permanent, token-specific compare-and-swap fence.
@@ -1203,17 +1205,16 @@ async function enqueueTelegramInbox(store: TelegramSharedStore, sessionId: strin
 	catch (error) { if (isErrno(error, "EEXIST")) return false; throw error; }
 }
 
-/** Best-effort bounded cleanup: only durable completions are eligible. */
+/** Best-effort cleanup: only durable completions are eligible. */
 async function cleanupTelegramInboxDone(store: TelegramSharedStore): Promise<void> {
 	const cutoff = Date.now() - TELEGRAM_INBOX_DONE_RETENTION_MS;
 	let sessions: string[];
-	try { sessions = (await readdir(store.inboxDir)).slice(0, 100); }
+	try { sessions = await readdir(store.inboxDir); }
 	catch (error) { if (isErrno(error, "ENOENT")) return; throw error; }
 	for (const session of sessions) {
 		const dir = join(store.inboxDir, session);
 		try {
-			const entries = (await readdir(dir)).slice(0, 500);
-			for (const entry of entries) {
+			for (const entry of await readdir(dir)) {
 				if (!entry.endsWith(".done")) continue;
 				const path = join(dir, entry);
 				if ((await stat(path)).mtimeMs < cutoff) await rm(path, { force: true });
@@ -1301,7 +1302,13 @@ class TelegramBotPoller {
 				await mkdir(this.store.registrationsDir, { recursive: true, mode: 0o700 });
 				if (generation !== this.activeGeneration) return;
 				await writeJsonFileAtomic(path, { sessionId: routing.sessionId, instanceId, pid: process.pid, heartbeatAt: Date.now(), title: routing.sessionName || routing.sessionId.slice(0, 8), ...(binding ? { threadId: binding.threadId } : {}) });
-				if (generation === this.activeGeneration) this.localSession = { sessionId: routing.sessionId, instanceId, deliver };
+				await telegramRegistrationTestBarrier?.();
+				if (generation !== this.activeGeneration) {
+					const current = await readJsonFile<TelegramSessionRegistration>(path);
+					if (current?.instanceId === instanceId) await rm(path, { force: true });
+					return;
+				}
+				this.localSession = { sessionId: routing.sessionId, instanceId, deliver };
 			});
 		});
 		await register();
@@ -3764,6 +3771,7 @@ export const __telegramTestHooks = {
 	isInvalidTopicDescription: (description: string) => isInvalidTopic(new TelegramApiError(400, description)),
 	setLeaseBarrier: (barrier: typeof telegramLeaseTestBarrier) => { telegramLeaseTestBarrier = barrier; },
 	setPollingBarrier: (barrier: typeof telegramPollingTestBarrier) => { telegramPollingTestBarrier = barrier; },
+	setRegistrationBarrier: (barrier: typeof telegramRegistrationTestBarrier) => { telegramRegistrationTestBarrier = barrier; },
 	createPoller: (config: TelegramConfig) => new TelegramBotPoller(config),
 	storeForConfig: createTelegramSharedStore,
 	resolveTopicName: resolveTelegramTopicName,

@@ -1142,6 +1142,45 @@ describe("ask_user", () => {
 			} finally { lease.setPollingBarrier(undefined); }
 		});
 
+		test("deactivation removes a registration written before local publication", async () => {
+			const lease = await hooks();
+			const config = { botToken: "deactivate-registration-race", chatId: "4242", apiBaseUrl: "https://telegram.test" };
+			const store = lease.storeForConfig(config); rmSync(store.rootDir, { recursive: true, force: true });
+			stubEnv("PI_TELEGRAM_REGISTRATION_INTERVAL_MS", "5");
+			const calls: string[] = [];
+			stubFetch((url) => { calls.push(url.split("/").pop()!); return telegramOk([]); });
+			let written = false; let resume!: () => void;
+			const paused = new Promise<void>((resolve) => { resume = resolve; });
+			lease.setRegistrationBarrier(async () => { written = true; await paused; });
+			try {
+				const poller = lease.createPoller(config);
+				const activating = poller.activateSession({ sessionId: "race", cwd: process.cwd() }, async () => "idle");
+				await waitUntil(() => written);
+				const stopping = poller.deactivateSession();
+				resume(); await Promise.all([activating, stopping]);
+				expect(existsSync(join(store.registrationsDir, readdirSync(store.registrationsDir)[0] ?? "missing"))).toBe(false);
+				await new Promise((resolve) => setTimeout(resolve, 15));
+				expect(calls).toEqual([]);
+			} finally { lease.setRegistrationBarrier(undefined); }
+		});
+
+		test("repeated activation cannot re-register after final deactivation", async () => {
+			const lease = await hooks();
+			const config = { botToken: "repeated-deactivation", chatId: "4242", apiBaseUrl: "https://telegram.test" };
+			const store = lease.storeForConfig(config); rmSync(store.rootDir, { recursive: true, force: true });
+			stubEnv("PI_TELEGRAM_REGISTRATION_INTERVAL_MS", "5");
+			stubFetch((url, init) => {
+				if (url.split("/").pop() === "getUpdates") return new Promise<Response>((resolve) => (init?.signal as AbortSignal).addEventListener("abort", () => resolve(telegramOk([])), { once: true }));
+				return telegramOk([]);
+			});
+			const poller = lease.createPoller(config);
+			await poller.activateSession({ sessionId: "first", cwd: process.cwd() }, async () => "idle");
+			await poller.activateSession({ sessionId: "second", cwd: process.cwd() }, async () => "idle");
+			await poller.deactivateSession();
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(readdirSync(store.registrationsDir)).toEqual([]);
+		});
+
 		test("durable completion prevents replay after acknowledgement failure", async () => {
 			const lease = await hooks(); const config = { botToken: "ack-failure", chatId: "4242", apiBaseUrl: "https://telegram.test" };
 			const store = lease.storeForConfig(config); rmSync(store.rootDir, { recursive: true, force: true });
@@ -1166,6 +1205,22 @@ describe("ask_user", () => {
 			await lease.cleanupInboxDone(store);
 			expect(existsSync(oldDone)).toBe(false); expect(existsSync(old)).toBe(false); expect(existsSync(empty)).toBe(false);
 			expect(existsSync(join(live, "2.json.done"))).toBe(true); expect(existsSync(join(live, "3.json"))).toBe(true); expect(existsSync(join(live, "4.json.claimed.owner"))).toBe(true);
+		});
+
+		test("sweeps expired completions beyond former directory and entry prefixes", async () => {
+			const lease = await hooks();
+			const store = lease.storeForConfig({ botToken: "inbox-cleanup-large", chatId: "4242", apiBaseUrl: "https://telegram.test" });
+			rmSync(store.rootDir, { recursive: true, force: true });
+			for (let i = 0; i <= 100; i++) mkdirSync(join(store.inboxDir, `session-${String(i).padStart(3, "0")}`), { recursive: true });
+			const target = join(store.inboxDir, "zz-target"); mkdirSync(target, { recursive: true });
+			for (let i = 0; i <= 500; i++) writeFileSync(join(target, `entry-${String(i).padStart(3, "0")}.json.done`), "{}");
+			const expired = join(target, "zz-expired.json.done"); writeFileSync(expired, "{}");
+			utimesSync(expired, new Date(Date.now() - 8 * 24 * 60 * 60 * 1_000), new Date(Date.now() - 8 * 24 * 60 * 60 * 1_000));
+			writeFileSync(join(target, "preserve.json"), "{}"); writeFileSync(join(target, "preserve.json.claimed.owner"), "{}");
+			await lease.cleanupInboxDone(store);
+			expect(existsSync(expired)).toBe(false);
+			expect(existsSync(join(target, "entry-500.json.done"))).toBe(true);
+			expect(existsSync(join(target, "preserve.json"))).toBe(true); expect(existsSync(join(target, "preserve.json.claimed.owner"))).toBe(true);
 		});
 	});
 
