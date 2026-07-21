@@ -15,6 +15,7 @@
 ### Fixed
 
 - Idle Telegram notifications now wait until all async subagent runs complete, reconcile active runs after extension reloads or missed start events, and are disabled entirely inside subagent child processes.
+- Idle Telegram notifications now defer through Pi auto-compaction, avoiding false idle notices before an automatic retry continues.
 
 ## [0.11.1](https://github.com/edlsh/pi-telegram-notify/releases/tag/v0.11.1) - 2026-05-23
 

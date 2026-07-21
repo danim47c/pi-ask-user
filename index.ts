@@ -3767,9 +3767,20 @@ export default function (pi: ExtensionAPI) {
 	const activeAsyncRunIds = new Set<string>();
 	let asyncEventRevision = 0;
 	let subagentRpcAvailable = false;
+	let autoCompactionActive = false;
+	let latestAgentEnd:
+		| { event: unknown; ctx: unknown }
+		| undefined;
 	let deferredAgentEnd:
 		| { event: unknown; ctx: unknown }
 		| undefined;
+
+	function scheduleDeferredAgentEndNotice() {
+		if (autoCompactionActive || activeAsyncRunIds.size > 0 || !deferredAgentEnd) return;
+		const deferred = deferredAgentEnd;
+		deferredAgentEnd = undefined;
+		scheduleAgentEndTelegramNotice(deferred.event, deferred.ctx);
+	}
 
 	pi.events.on(SUBAGENT_RPC_READY_EVENT, () => {
 		subagentRpcAvailable = true;
@@ -3786,11 +3797,7 @@ export default function (pi: ExtensionAPI) {
 		if (!id) return;
 		asyncEventRevision += 1;
 		activeAsyncRunIds.delete(id);
-		if (activeAsyncRunIds.size > 0 || !deferredAgentEnd) return;
-
-		const deferred = deferredAgentEnd;
-		deferredAgentEnd = undefined;
-		scheduleAgentEndTelegramNotice(deferred.event, deferred.ctx);
+		scheduleDeferredAgentEndNotice();
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -3800,15 +3807,19 @@ export default function (pi: ExtensionAPI) {
 		if (event.source !== "extension") {
 			await recordHumanActivity().catch(() => undefined);
 		}
+		latestAgentEnd = undefined;
 		deferredAgentEnd = undefined;
 		cancelPendingAgentEndTelegramNotice();
 	});
 	pi.on("before_agent_start", async () => {
+		autoCompactionActive = false;
+		latestAgentEnd = undefined;
 		deferredAgentEnd = undefined;
 		cancelPendingAgentEndTelegramNotice();
 	});
 	pi.on("agent_end", async (event, ctx) => {
 		if (process.env.PI_SUBAGENT_CHILD === "1") return;
+		latestAgentEnd = { event, ctx };
 
 		if (subagentRpcAvailable) {
 			const revision = asyncEventRevision;
@@ -3819,16 +3830,41 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		if (activeAsyncRunIds.size > 0) {
+		if (autoCompactionActive || activeAsyncRunIds.size > 0) {
 			deferredAgentEnd = { event, ctx };
 			cancelPendingAgentEndTelegramNotice();
 			return;
 		}
 
+		deferredAgentEnd = undefined;
 		scheduleAgentEndTelegramNotice(event, ctx);
+	});
+	const onAutoCompaction = pi.on as unknown as (
+		event: string,
+		handler: (event: { willRetry?: boolean }) => Promise<void>,
+	) => void;
+	// The installed Pi type declarations may lag these runtime lifecycle events.
+	onAutoCompaction("auto_compaction_start", async () => {
+		if (process.env.PI_SUBAGENT_CHILD === "1") return;
+		autoCompactionActive = true;
+		deferredAgentEnd = latestAgentEnd;
+		cancelPendingAgentEndTelegramNotice();
+	});
+	onAutoCompaction("auto_compaction_end", async (event) => {
+		if (process.env.PI_SUBAGENT_CHILD === "1") return;
+		autoCompactionActive = false;
+		if (event?.willRetry === true) {
+			// This end belongs to the compacted turn; await the retry's real end.
+			latestAgentEnd = undefined;
+			deferredAgentEnd = undefined;
+			return;
+		}
+		scheduleDeferredAgentEndNotice();
 	});
 	pi.on("session_shutdown", async () => {
 		await telegramNotifyManager.deactivateSession();
+		autoCompactionActive = false;
+		latestAgentEnd = undefined;
 		deferredAgentEnd = undefined;
 		activeAsyncRunIds.clear();
 		cancelPendingAgentEndTelegramNotice();

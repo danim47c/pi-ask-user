@@ -2015,6 +2015,115 @@ describe("ask_user", () => {
 	});
 
 	describe("agent_end Telegram notifications", () => {
+		test("compaction start cancels a pending idle notification", async () => {
+			stubTelegramSettings("123456:TEST_TOKEN_COMPACTION_CANCEL", "4242");
+			stubEnv("PI_TELEGRAM_NOTIFY_DELAY_MS", "15");
+			const extension = await setupExtension();
+			await runExtensionHandlers(extension, "session_start", {}, {
+				cwd: "/tmp/project", isIdle: () => true,
+				sessionManager: { getSessionId: () => "compaction-cancel", getSessionName: () => undefined },
+			});
+			const calls: string[] = [];
+			const idleCalls = () => calls.filter((method) => method === "sendMessage" || method === "sendRichMessage");
+			stubFetch((url) => {
+				calls.push(url.split("/").pop()!);
+				return telegramOk({ message_id: 507, chat: { id: 4242 } });
+			});
+
+			await runExtensionHandlers(extension, "agent_end", {
+				messages: [{ role: "assistant", content: "Before compaction" }],
+			});
+			await runExtensionHandlers(extension, "auto_compaction_start");
+			await new Promise((resolve) => setTimeout(resolve, 35));
+
+			expect(idleCalls()).toEqual([]);
+			await runExtensionHandlers(extension, "session_shutdown");
+		});
+
+		test("waits for a genuine retry end after compaction retries", async () => {
+			stubTelegramSettings("123456:TEST_TOKEN_COMPACTION_RETRY", "4242");
+			stubEnv("PI_TELEGRAM_NOTIFY_DELAY_MS", "10");
+			const extension = await setupExtension();
+			await runExtensionHandlers(extension, "session_start", {}, {
+				cwd: "/tmp/project", isIdle: () => true,
+				sessionManager: { getSessionId: () => "compaction-retry", getSessionName: () => undefined },
+			});
+			const calls: string[] = [];
+			const idleCalls = () => calls.filter((method) => method === "sendMessage" || method === "sendRichMessage");
+			stubFetch((url) => {
+				calls.push(url.split("/").pop()!);
+				return telegramOk({ message_id: 508, chat: { id: 4242 } });
+			});
+
+			await runExtensionHandlers(extension, "agent_end", {
+				messages: [{ role: "assistant", content: "Stale end" }],
+			});
+			await runExtensionHandlers(extension, "auto_compaction_start");
+			await runExtensionHandlers(extension, "auto_compaction_end", { willRetry: true });
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			expect(idleCalls()).toEqual([]);
+			stubEnv("PI_TELEGRAM_NOTIFY_DELAY_MS", "0");
+
+			await runExtensionHandlers(extension, "before_agent_start");
+			await runExtensionHandlers(extension, "agent_end", {
+				messages: [{ role: "assistant", content: "Retry finished" }],
+			});
+			await waitUntil(() => idleCalls().length === 1);
+			expect(idleCalls()).toHaveLength(1);
+			await runExtensionHandlers(extension, "session_shutdown");
+		});
+
+		test("reschedules an idle notification when compaction does not retry", async () => {
+			stubTelegramSettings("123456:TEST_TOKEN_COMPACTION_SETTLE", "4242");
+			stubEnv("PI_TELEGRAM_NOTIFY_DELAY_MS", "10");
+			const extension = await setupExtension();
+			await runExtensionHandlers(extension, "session_start", {}, {
+				cwd: "/tmp/project", isIdle: () => true,
+				sessionManager: { getSessionId: () => "compaction-settle", getSessionName: () => undefined },
+			});
+			const calls: string[] = [];
+			const idleCalls = () => calls.filter((method) => method === "sendMessage" || method === "sendRichMessage");
+			stubFetch((url) => {
+				calls.push(url.split("/").pop()!);
+				return telegramOk({ message_id: 509, chat: { id: 4242 } });
+			});
+
+			await runExtensionHandlers(extension, "agent_end", {
+				messages: [{ role: "assistant", content: "Compaction settles" }],
+			});
+			await runExtensionHandlers(extension, "auto_compaction_start");
+			await runExtensionHandlers(extension, "auto_compaction_end", { willRetry: false });
+			await waitUntil(() => idleCalls().length === 1);
+			await runExtensionHandlers(extension, "session_shutdown");
+		});
+
+		test("cancels a non-retrying compaction idle reschedule on the next turn", async () => {
+			stubTelegramSettings("123456:TEST_TOKEN_COMPACTION_NEXT_TURN", "4242");
+			stubEnv("PI_TELEGRAM_NOTIFY_DELAY_MS", "25");
+			const extension = await setupExtension();
+			await runExtensionHandlers(extension, "session_start", {}, {
+				cwd: "/tmp/project", isIdle: () => true,
+				sessionManager: { getSessionId: () => "compaction-next-turn", getSessionName: () => undefined },
+			});
+			const calls: string[] = [];
+			const idleCalls = () => calls.filter((method) => method === "sendMessage" || method === "sendRichMessage");
+			stubFetch((url) => {
+				calls.push(url.split("/").pop()!);
+				return telegramOk({ message_id: 510, chat: { id: 4242 } });
+			});
+
+			await runExtensionHandlers(extension, "agent_end", {
+				messages: [{ role: "assistant", content: "Compaction next turn" }],
+			});
+			await runExtensionHandlers(extension, "auto_compaction_start");
+			await runExtensionHandlers(extension, "auto_compaction_end", { willRetry: false });
+			await runExtensionHandlers(extension, "before_agent_start");
+			await new Promise((resolve) => setTimeout(resolve, 45));
+
+			expect(idleCalls()).toEqual([]);
+			await runExtensionHandlers(extension, "session_shutdown");
+		});
+
 		test("reconciles async runs when their start event was missed", async () => {
 			stubTelegramSettings("123456:TEST_TOKEN_AGENT_END_RECONCILE", "4242");
 			stubEnv("PI_TELEGRAM_NOTIFY_DELAY_MS", "10");
