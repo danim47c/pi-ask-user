@@ -130,10 +130,15 @@ In normal mode, `ask_user` has no implicit timeout; only a positive per-call
 `timeout` applies. A timeout does not change availability. On timeout, the tool
 returns guidance to continue safely or pause an active goal.
 
-Use `/ask-away` to manually enter away mode. While away, the configured
-one-minute default timeout is an upper bound on any explicit per-call timeout.
-Use `/ask-reset` to return to normal mode. Existing human activity also resets
-away mode to normal. Check the current mode with `/ask-status`.
+Use `/ask` or `/ask status` to check availability. Use `/ask away` to enter
+away mode; while away, the configured one-minute default timeout is an upper
+bound on any explicit per-call timeout. Use `/ask reset` to return to normal
+mode. Existing human activity also resets away mode to normal. Invalid input
+shows `/ask [status|away|reset]`.
+
+Availability configuration in `~/.pi/agent/settings.json` and mutable presence
+state in `~/.pi/agent/ask-user-presence.json` are global and shared by all Pi
+sessions. Every `/ask` command affects all active and future sessions.
 
 Configure the away limit in `~/.pi/agent/settings.json`:
 

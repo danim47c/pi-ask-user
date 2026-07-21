@@ -6,7 +6,7 @@
 
 - Local Pi notifications when an `ask_user` prompt opens.
 - Herdr blocked-state reporting while an `ask_user` prompt is awaiting input, cleared reliably on answers, cancellation, timeout, or tool failure.
-- Cross-session `ask_user` availability policy with no implicit normal timeout, manual `/ask-away`, `/ask-reset`, and `/ask-status` commands, one-minute default away cap, human-activity reset, adaptive Telegram steer delivery, and goal-safe timeout guidance.
+- Cross-session `ask_user` availability policy with no implicit normal timeout, unified `/ask [status|away|reset]` command, one-minute default away cap, human-activity reset, adaptive Telegram steer delivery, and goal-safe timeout guidance.
 - Optional Telegram notifications configured in `~/.pi/agent/settings.json` under top-level `telegram.botToken` and `telegram.chatId`; ask prompts are delayed by 60 seconds, suppressed when answered locally before then, include the full prompt, hidden request IDs in callback data, A/B/C-style quick-reply buttons, custom-answer prompts, selection comments in reply text, reply-to-message handling, answer-state message edits, and request correlation for simultaneous prompts across independent Pi sessions via shared token-hashed temp state and a single polling lock.
 - Telegram notifications when the Pi agent reaches `agent_end`/idle, also delayed by 60 seconds, suppressed if the user responds before then, and edited as resumed if already sent.
 - Compact rich Telegram messages with escaped HTML/details blocks and automatic private-chat forum topics; topic use falls back safely to the general chat.

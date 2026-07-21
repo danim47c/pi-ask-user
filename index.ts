@@ -3834,9 +3834,26 @@ export default function (pi: ExtensionAPI) {
 		cancelPendingAgentEndTelegramNotice();
 	});
 
-	pi.registerCommand("ask-status", {
-		description: "Show ask_user availability mode and response timeouts",
-		handler: async (_args, ctx) => {
+	pi.registerCommand("ask", {
+		description: "Show or set global ask_user availability: status, away, or reset",
+		handler: async (args, ctx) => {
+			const subcommands = args.trim().split(/\s+/).filter(Boolean);
+			const subcommand = subcommands[0]?.toLowerCase();
+			if (subcommands.length > 1 || (subcommand && !["status", "away", "reset"].includes(subcommand))) {
+				ctx.ui.notify("Usage: /ask [status|away|reset]", "warning");
+				return;
+			}
+			if (subcommand === "away") {
+				await setUserAway();
+				ctx.ui.notify("ask_user availability set to away", "info");
+				return;
+			}
+			if (subcommand === "reset") {
+				await recordHumanActivity();
+				ctx.ui.notify("ask_user availability reset to normal", "info");
+				return;
+			}
+
 			const [config, presence] = await Promise.all([
 				resolveAskAvailabilityConfig(),
 				readAskPresenceState(),
@@ -3854,20 +3871,6 @@ export default function (pi: ExtensionAPI) {
 					.join("\n"),
 				"info",
 			);
-		},
-	});
-	pi.registerCommand("ask-reset", {
-		description: "Reset ask_user availability to normal",
-		handler: async (_args, ctx) => {
-			await recordHumanActivity();
-			ctx.ui.notify("ask_user availability reset to normal", "info");
-		},
-	});
-	pi.registerCommand("ask-away", {
-		description: "Set ask_user availability to away (one-minute timeout by default)",
-		handler: async (_args, ctx) => {
-			await setUserAway();
-			ctx.ui.notify("ask_user availability set to away", "info");
 		},
 	});
 

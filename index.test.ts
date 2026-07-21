@@ -579,7 +579,7 @@ describe("ask_user", () => {
 		expect(timedOut.details.timedOut).toBe(true);
 		expect(timedOut.details.timeoutMs).toBe(5);
 		const notifications: string[] = [];
-		await extension.commands.get("ask-status")?.handler("", { ui: { notify: (message: string) => notifications.push(message) } });
+		await extension.commands.get("ask")?.handler("", { ui: { notify: (message: string) => notifications.push(message) } });
 		expect(notifications.at(-1)).toContain("availability: normal");
 	});
 
@@ -589,10 +589,10 @@ describe("ask_user", () => {
 		const pendingCtx = { hasUI: true, ui: { custom: async (factory: any) => await new Promise((resolve) => {
 			factory({ requestRender() {}, terminal: { rows: 24 } }, createTheme(), createKeybindings(), resolve);
 		}) } };
-		await extension.commands.get("ask-away")?.handler("", { ui: { notify() {} } });
+		await extension.commands.get("ask")?.handler("away", { ui: { notify() {} } });
 		const away = await extension.tool.execute("away", { question: "Away?", options: ["A"], timeout: 50 }, undefined, undefined, pendingCtx);
 		expect(away.details.timeoutMs).toBe(7);
-		await extension.commands.get("ask-reset")?.handler("", { ui: { notify() {} } });
+		await extension.commands.get("ask")?.handler("reset", { ui: { notify() {} } });
 		const reset = await extension.tool.execute("reset", { question: "Reset?", options: ["A"] }, undefined, undefined, {
 			hasUI: true,
 			ui: { custom: async (factory: any) => await new Promise((resolve) => {
@@ -603,19 +603,65 @@ describe("ask_user", () => {
 		expect(reset.details.timedOut).toBeUndefined();
 	});
 
-	test("registers status, away, and reset availability commands", async () => {
+	test("registers only the unified ask availability command", async () => {
+		const extension = await setupExtension();
+		expect([...extension.commands.keys()]).toEqual(["ask"]);
+		expect(extension.commands.has("ask-status")).toBe(false);
+		expect(extension.commands.has("ask-away")).toBe(false);
+		expect(extension.commands.has("ask-reset")).toBe(false);
+	});
+
+	test("ask with no argument and status show the same availability", async () => {
 		stubAskAvailabilitySettings(60_000);
 		const extension = await setupExtension();
 		const notifications: string[] = [];
 		const ctx = { ui: { notify(message: string) { notifications.push(message); } } };
-		await extension.commands.get("ask-away")?.handler("", ctx);
-		await extension.commands.get("ask-status")?.handler("", ctx);
-		expect(notifications.at(-1)).toContain("availability: away");
-		expect(notifications.at(-1)).toContain("Normal timeout: none (explicit per-call only)");
-		expect(notifications.at(-1)).toContain("Away timeout: 1 min");
-		await extension.commands.get("ask-reset")?.handler("", ctx);
-		await extension.commands.get("ask-status")?.handler("", ctx);
-		expect(notifications.at(-1)).toContain("availability: normal");
+		const ask = extension.commands.get("ask")!;
+		await ask.handler("", ctx);
+		const noArgument = notifications.at(-1);
+		await ask.handler(" status ", ctx);
+		expect(notifications.at(-1)).toBe(noArgument);
+		expect(noArgument).toContain("availability: normal");
+	});
+
+	test("ask away and reset accept whitespace and case", async () => {
+		const extension = await setupExtension();
+		const notifications: string[] = [];
+		const ctx = { ui: { notify(message: string) { notifications.push(message); } } };
+		const ask = extension.commands.get("ask")!;
+		await ask.handler(" AWAY ", ctx);
+		expect(notifications.at(-1)).toBe("ask_user availability set to away");
+		await ask.handler(" RESET ", ctx);
+		expect(notifications.at(-1)).toBe("ask_user availability reset to normal");
+	});
+
+	test("ask invalid input reports usage without mutating availability", async () => {
+		const extension = await setupExtension();
+		const notifications: Array<{ message: string; level: string }> = [];
+		const ctx = { ui: { notify(message: string, level: string) { notifications.push({ message, level }); } } };
+		const ask = extension.commands.get("ask")!;
+		await ask.handler("away", ctx);
+		await ask.handler("unknown", ctx);
+		expect(notifications.at(-1)).toEqual({ message: "Usage: /ask [status|away|reset]", level: "warning" });
+		await ask.handler("status now", ctx);
+		expect(notifications.at(-1)).toEqual({ message: "Usage: /ask [status|away|reset]", level: "warning" });
+		await ask.handler("status", ctx);
+		expect(notifications.at(-1)?.message).toContain("availability: away");
+	});
+
+	test("availability state is shared across extension instances", async () => {
+		const extensionA = await setupExtension();
+		const extensionB = await setupExtension();
+		const notificationsA: string[] = [];
+		const notificationsB: string[] = [];
+		const ctxA = { ui: { notify(message: string) { notificationsA.push(message); } } };
+		const ctxB = { ui: { notify(message: string) { notificationsB.push(message); } } };
+		await extensionA.commands.get("ask")!.handler("away", ctxA);
+		await extensionB.commands.get("ask")!.handler("status", ctxB);
+		expect(notificationsB.at(-1)).toContain("availability: away");
+		await extensionB.commands.get("ask")!.handler("reset", ctxB);
+		await extensionA.commands.get("ask")!.handler("status", ctxA);
+		expect(notificationsA.at(-1)).toContain("availability: normal");
 	});
 
 	test("uses PI_ASK_USER_DISPLAY_MODE env var when call-level displayMode is omitted", async () => {
